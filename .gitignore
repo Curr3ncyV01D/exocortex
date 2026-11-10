@@ -1,0 +1,39 @@
+# --- Local Data Files ---
+.context/
+.data/
+
+# --- Python Virtual Environment ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Byte-compiled / Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Secrets & Environment Variables ---
+.env
+.env.local
+.env.*.local
+
+# --- Application Data & SQLite Storage ---
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/raw/*
+!data/raw/.gitkeep
+!data/.gitkeep
+
+# --- IDEs & System Files ---
+.vscode/
+.idea/
+.trae/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
