@@ -208,4 +208,5 @@ class MergeEvent(Message):
 
     __mapper_args__ = {
         "polymorphic_identity": MessageRole.SYSTEM_MERGE,
+        "inherit_condition": (message_id == Message.id),
     }
