@@ -1,0 +1,346 @@
+import uuid
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.storage.crud_graph import (
+    BranchAlreadyExistsError,
+    BranchNotFoundError,
+    MessageNotFoundError,
+    NoActiveMessagesToMergeError,
+    branch_from_here,
+    reconstruct_context,
+    squash_merge_branch,
+    toggle_message_active,
+    update_message_content,
+)
+from src.storage.models import Branch, MergeEvent, Message, MessageRole
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_context_linear_order(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка хронологического восстановления цепочки сообщений (Алгоритм 3.1)."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    msg2_id = str(uuid.uuid4())
+    msg2 = Message(
+        id=msg2_id,
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.MODEL,
+        content="Response 1",
+    )
+    session.add(msg2)
+
+    msg3_id = str(uuid.uuid4())
+    msg3 = Message(
+        id=msg3_id,
+        chat_id=chat_id,
+        parent_id=msg2_id,
+        role=MessageRole.USER,
+        content="Prompt 2",
+    )
+    session.add(msg3)
+
+    stmt = select(Branch).where(
+        Branch.chat_id == chat_id,
+        Branch.name == "main",
+    )
+    branch = (await session.execute(stmt)).scalar_one()
+    branch.head_message_id = msg3_id
+    await session.commit()
+
+    timeline = await reconstruct_context(chat_id, "main", session)
+
+    assert len(timeline) == 3
+    assert [m.id for m in timeline] == [root_id, msg2_id, msg3_id]
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_context_role_sanitization(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка склеивания двух подряд идущих сообщений модели при санитизации (Алгоритм 3.1)."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    msg2_id = str(uuid.uuid4())
+    msg2 = Message(
+        id=msg2_id,
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.MODEL,
+        content="Part 1",
+        is_active=True,
+    )
+    session.add(msg2)
+
+    msg3_id = str(uuid.uuid4())
+    msg3 = Message(
+        id=msg3_id,
+        chat_id=chat_id,
+        parent_id=msg2_id,
+        role=MessageRole.USER,
+        content="Middle prompt",
+        is_active=False,
+    )
+    session.add(msg3)
+
+    msg4_id = str(uuid.uuid4())
+    msg4 = Message(
+        id=msg4_id,
+        chat_id=chat_id,
+        parent_id=msg3_id,
+        role=MessageRole.MODEL,
+        content="Part 2",
+        is_active=True,
+    )
+    session.add(msg4)
+
+    stmt = select(Branch).where(
+        Branch.chat_id == chat_id,
+        Branch.name == "main",
+    )
+    branch = (await session.execute(stmt)).scalar_one()
+    branch.head_message_id = msg4_id
+    await session.commit()
+
+    timeline = await reconstruct_context(chat_id, "main", session)
+
+    assert len(timeline) == 2
+    assert timeline[0].id == root_id
+    assert timeline[1].role == MessageRole.MODEL
+    assert timeline[1].content == "Part 1\n\nPart 2"
+
+
+@pytest.mark.asyncio
+async def test_branch_from_here_success(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка корректного создания указателя ветки (Алгоритм 3.2)."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    branch = await branch_from_here(
+        chat_id=chat_id,
+        target_message_id=root_id,
+        new_branch_name="feature/test",
+        session=session,
+    )
+
+    assert branch.name == "feature/test"
+    assert branch.head_message_id == root_id
+    assert branch.forked_from_id == root_id
+
+
+@pytest.mark.asyncio
+async def test_branch_from_here_duplicate_name_error(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка запрета на создание дублирующего имени ветки в рамках одного чата."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    with pytest.raises(BranchAlreadyExistsError):
+        await branch_from_here(
+            chat_id=chat_id,
+            target_message_id=root_id,
+            new_branch_name="main",
+            session=session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_message_content_ancestor_warning(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка срабатывания защиты при мутации узла с несколькими потомками (Алгоритм 3.3)."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    child1 = Message(
+        id=str(uuid.uuid4()),
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.USER,
+        content="Child 1",
+    )
+    child2 = Message(
+        id=str(uuid.uuid4()),
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.USER,
+        content="Child 2",
+    )
+    session.add_all([child1, child2])
+    await session.commit()
+
+    result = await update_message_content(
+        message_id=root_id,
+        new_content="Mutated root",
+        force=False,
+        session=session,
+    )
+
+    assert result["status"] == "warning_required"
+    assert result["children_count"] == 2
+
+    root_msg = await session.get(Message, root_id)
+    assert root_msg.content == "Root prompt"
+    assert root_msg.is_edited is False
+
+
+@pytest.mark.asyncio
+async def test_update_message_content_force_success(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка принудительной мутации узла при передаче флага force=True."""
+    root_id = initial_chat_setup["root_message_id"]
+
+    result = await update_message_content(
+        message_id=root_id,
+        new_content="Force edited content",
+        force=True,
+        session=session,
+    )
+
+    assert result["status"] == "success"
+
+    root_msg = await session.get(Message, root_id)
+    assert root_msg.content == "Force edited content"
+    assert root_msg.is_edited is True
+    assert root_msg.updated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_toggle_message_active_invariants(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка тумблера видимости и инварианта неизменности updated_at (Алгоритм 3.5)."""
+    root_id = initial_chat_setup["root_message_id"]
+
+    new_state = await toggle_message_active(root_id, session)
+    assert new_state is False
+
+    msg = await session.get(Message, root_id)
+    assert msg.is_active is False
+    assert msg.updated_at is None
+
+    new_state = await toggle_message_active(root_id, session)
+    assert new_state is True
+
+
+@pytest.mark.asyncio
+async def test_squash_merge_branch_incremental(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка инкрементального сжатия ветки и создания MergeEvent (Алгоритм 3.4)."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    branch = await branch_from_here(
+        chat_id=chat_id,
+        target_message_id=root_id,
+        new_branch_name="feature/sandbox",
+        session=session,
+    )
+
+    msg_b1_id = str(uuid.uuid4())
+    msg_b1 = Message(
+        id=msg_b1_id,
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.USER,
+        content="Sub-idea 1",
+    )
+    session.add(msg_b1)
+
+    msg_b2_id = str(uuid.uuid4())
+    msg_b2 = Message(
+        id=msg_b2_id,
+        chat_id=chat_id,
+        parent_id=msg_b1_id,
+        role=MessageRole.MODEL,
+        content="Sub-idea 2",
+    )
+    session.add(msg_b2)
+
+    branch.head_message_id = msg_b2_id
+    await session.commit()
+
+    mock_summarizer = AsyncMock(return_value="Synthesized conclusion of sandbox")
+
+    merge_result = await squash_merge_branch(
+        chat_id=chat_id,
+        source_branch_name="feature/sandbox",
+        target_branch_name="main",
+        summarizer_func=mock_summarizer,
+        session=session,
+    )
+
+    assert merge_result["status"] == "success"
+
+    stmt_main = select(Branch).where(
+        Branch.chat_id == chat_id,
+        Branch.name == "main",
+    )
+    main_branch = (await session.execute(stmt_main)).scalar_one()
+    merge_node_id = main_branch.head_message_id
+
+    merge_msg = await session.get(Message, merge_node_id)
+    assert merge_msg.role == MessageRole.SYSTEM_MERGE
+    assert merge_msg.content == "Synthesized conclusion of sandbox"
+    assert merge_msg.parent_id == root_id
+
+    merge_event = await session.get(MergeEvent, merge_node_id)
+    assert merge_event is not None
+    assert merge_event.source_branch_name == "feature/sandbox"
+    assert merge_event.compressed_messages_count == 2
+
+    stmt_source = select(Branch).where(
+        Branch.chat_id == chat_id,
+        Branch.name == "feature/sandbox",
+    )
+    source_branch = (await session.execute(stmt_source)).scalar_one()
+    assert source_branch.last_merged_message_id == msg_b2_id
+
+
+@pytest.mark.asyncio
+async def test_squash_merge_empty_delta_fails(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка запрета на слияние ветки без новых сообщений."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    await branch_from_here(
+        chat_id=chat_id,
+        target_message_id=root_id,
+        new_branch_name="feature/empty",
+        session=session,
+    )
+
+    mock_summarizer = AsyncMock()
+
+    with pytest.raises(NoActiveMessagesToMergeError):
+        await squash_merge_branch(
+            chat_id=chat_id,
+            source_branch_name="feature/empty",
+            target_branch_name="main",
+            summarizer_func=mock_summarizer,
+            session=session,
+        )

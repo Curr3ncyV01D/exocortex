@@ -1,6 +1,6 @@
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -44,13 +44,13 @@ class Chat(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
@@ -107,11 +107,15 @@ class Branch(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
     chat: Mapped["Chat"] = relationship("Chat", back_populates="branches")
+    head_message: Mapped["Message"] = relationship(
+        "Message",
+        foreign_keys=[head_message_id],
+    )
 
 
 class Message(Base):
@@ -156,7 +160,7 @@ class Message(Base):
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
     updated_at: Mapped[Optional[datetime]] = mapped_column(
@@ -174,6 +178,7 @@ class Message(Base):
     __mapper_args__ = {
         "polymorphic_on": "role",
         "polymorphic_identity": MessageRole.USER,
+        "with_polymorphic": "*",
     }
 
 
