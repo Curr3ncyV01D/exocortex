@@ -139,3 +139,30 @@ async def test_gemini_client_summarize_delta_formats_prompt() -> None:
         assert "Ранее обсуждали выбор базы данных." in prompt_sent
         assert "Решили отказаться от Django?" in prompt_sent
         assert "Да, берем FastAPI." in prompt_sent
+
+
+@pytest.mark.asyncio
+async def test_gemini_client_summarize_delta_none_response() -> None:
+    """Проверка защиты от падения при пустом или заблокированном ответе SDK (text is None)."""
+    mock_response = MagicMock()
+    mock_response.text = None
+
+    delta = [
+        Message(
+            id=str(uuid.uuid4()),
+            chat_id="chat-1",
+            role=MessageRole.USER,
+            content="Тестовая реплика",
+        )
+    ]
+
+    with patch("src.agent.client.genai.Client") as mock_genai_cls:
+        mock_sdk_instance = mock_genai_cls.return_value
+        mock_sdk_instance.aio.models.generate_content = AsyncMock(
+            return_value=mock_response
+        )
+
+        client = GeminiClient(api_key="test-key")
+        summary = await client.summarize_delta(delta_messages=delta)
+
+        assert summary == ""

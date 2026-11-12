@@ -4,8 +4,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.tools import get_branch_summary, search_history_fts
-from src.storage.models import Branch, MergeEvent, Message, MessageRole
-
+from src.storage.crud.graph import toggle_message_active, update_message_content
+from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 
 @pytest.mark.asyncio
 async def test_search_history_fts_morphology(
@@ -199,3 +199,112 @@ async def test_get_branch_summary_not_found(
     )
 
     assert "Сводка для ветки 'non_existent_branch' не найдена" in summary
+
+
+@pytest.mark.asyncio
+async def test_search_history_fts_cross_chat_isolation(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка строгой изоляции поиска FTS5 между разными чатами."""
+    chat_a_id = initial_chat_setup["chat_id"]
+    root_a_id = initial_chat_setup["root_message_id"]
+
+    session.add(
+        Message(
+            id=str(uuid.uuid4()),
+            chat_id=chat_a_id,
+            parent_id=root_a_id,
+            role=MessageRole.USER,
+            content="СверхсекретныйКлючДоступа только для чата А",
+            is_active=True,
+        )
+    )
+
+    chat_b_id = str(uuid.uuid4())
+    session.add(Chat(id=chat_b_id, title="Chat B"))
+    await session.commit()
+
+    result = await search_history_fts(
+        chat_id=chat_b_id,
+        query="СверхсекретныйКлючДоступа",
+        exclude_message_ids=[],
+        session=session,
+    )
+
+    assert "СверхсекретныйКлючДоступа" not in result
+    assert "Ничего не найдено" in result
+
+
+@pytest.mark.asyncio
+async def test_search_history_fts_sync_after_edit_and_toggle(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка обновления триггера FTS5 при редактировании и скрытия при маскировании."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+    msg_id = str(uuid.uuid4())
+
+    session.add(
+        Message(
+            id=msg_id,
+            chat_id=chat_id,
+            parent_id=root_id,
+            role=MessageRole.USER,
+            content="Выбрали технологию Django",
+            is_active=True,
+        )
+    )
+    await session.commit()
+
+    await update_message_content(
+        message_id=msg_id,
+        new_content="Перешли на технологию FastAPI",
+        force=True,
+        session=session,
+    )
+
+    res_old = await search_history_fts(
+        chat_id=chat_id,
+        query="Django",
+        exclude_message_ids=[],
+        session=session,
+    )
+    assert "Ничего не найдено" in res_old
+
+    res_new = await search_history_fts(
+        chat_id=chat_id,
+        query="FastAPI",
+        exclude_message_ids=[],
+        session=session,
+    )
+    assert "FastAPI" in res_new
+
+    await toggle_message_active(msg_id, session)
+
+    res_disabled = await search_history_fts(
+        chat_id=chat_id,
+        query="FastAPI",
+        exclude_message_ids=[],
+        session=session,
+    )
+    assert "Ничего не найдено" in res_disabled
+
+
+@pytest.mark.asyncio
+async def test_search_history_fts_empty_or_punctuation_query(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка безопасной обработки пустых запросов и чистой пунктуации."""
+    chat_id = initial_chat_setup["chat_id"]
+
+    for empty_q in ["", "   ", "!!! ??? ---"]:
+        result = await search_history_fts(
+            chat_id=chat_id,
+            query=empty_q,
+            exclude_message_ids=[],
+            session=session,
+        )
+        assert result == "Ничего не найдено."

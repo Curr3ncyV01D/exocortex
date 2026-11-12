@@ -16,7 +16,7 @@ from src.storage.crud.graph import (
     toggle_message_active,
     update_message_content,
 )
-from src.storage.models import Branch, MergeEvent, Message, MessageRole
+from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 
 
 @pytest.mark.asyncio
@@ -344,3 +344,164 @@ async def test_squash_merge_empty_delta_fails(
             summarizer_func=mock_summarizer,
             session=session,
         )
+
+
+@pytest.mark.asyncio
+async def test_squash_merge_second_incremental_merge(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка второго инкрементального слияния: сжатию подлежит строго новая дельта."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    branch = await branch_from_here(
+        chat_id=chat_id,
+        target_message_id=root_id,
+        new_branch_name="feature/long-lived",
+        session=session,
+    )
+
+    msg_b1_id = str(uuid.uuid4())
+    msg_b2_id = str(uuid.uuid4())
+    session.add_all([
+        Message(id=msg_b1_id, chat_id=chat_id, parent_id=root_id, role=MessageRole.USER, content="Step 1"),
+        Message(id=msg_b2_id, chat_id=chat_id, parent_id=msg_b1_id, role=MessageRole.MODEL, content="Step 2"),
+    ])
+    branch.head_message_id = msg_b2_id
+    await session.commit()
+
+    mock_summarizer_1 = AsyncMock(return_value="Merge Summary 1")
+    res1 = await squash_merge_branch(
+        chat_id=chat_id,
+        source_branch_name="feature/long-lived",
+        target_branch_name="main",
+        summarizer_func=mock_summarizer_1,
+        session=session,
+    )
+    merge1_id = res1["merge_message_id"]
+
+    msg_b3_id = str(uuid.uuid4())
+    msg_b4_id = str(uuid.uuid4())
+    session.add_all([
+        Message(id=msg_b3_id, chat_id=chat_id, parent_id=msg_b2_id, role=MessageRole.USER, content="Step 3"),
+        Message(id=msg_b4_id, chat_id=chat_id, parent_id=msg_b3_id, role=MessageRole.MODEL, content="Step 4"),
+    ])
+    branch.head_message_id = msg_b4_id
+    await session.commit()
+
+    mock_summarizer_2 = AsyncMock(return_value="Merge Summary 2")
+    res2 = await squash_merge_branch(
+        chat_id=chat_id,
+        source_branch_name="feature/long-lived",
+        target_branch_name="main",
+        summarizer_func=mock_summarizer_2,
+        session=session,
+    )
+
+    passed_delta = mock_summarizer_2.call_args.args[0]
+    assert [m.id for m in passed_delta] == [msg_b3_id, msg_b4_id]
+    assert res2["compressed_messages_count"] == 2
+
+    merge2_msg = await session.get(Message, res2["merge_message_id"])
+    assert merge2_msg.parent_id == merge1_id
+
+    await session.refresh(branch)
+    assert branch.last_merged_message_id == msg_b4_id
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_context_preserves_consecutive_user_messages(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка сохранения подряд идущих реплик пользователя без их слияния."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    u2_id = str(uuid.uuid4())
+    u3_id = str(uuid.uuid4())
+    m1_id = str(uuid.uuid4())
+
+    session.add_all([
+        Message(id=u2_id, chat_id=chat_id, parent_id=root_id, role=MessageRole.USER, content="Дополнение 1"),
+        Message(id=u3_id, chat_id=chat_id, parent_id=u2_id, role=MessageRole.USER, content="Дополнение 2"),
+        Message(id=m1_id, chat_id=chat_id, parent_id=u3_id, role=MessageRole.MODEL, content="Ответ модели"),
+    ])
+
+    stmt = select(Branch).where(Branch.chat_id == chat_id, Branch.name == "main")
+    main_branch = (await session.execute(stmt)).scalar_one()
+    main_branch.head_message_id = m1_id
+    await session.commit()
+
+    timeline = await reconstruct_context(chat_id, "main", session)
+
+    assert len(timeline) == 4
+    assert [m.role for m in timeline] == [
+        MessageRole.USER,
+        MessageRole.USER,
+        MessageRole.USER,
+        MessageRole.MODEL,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_from_here_cross_chat_isolation(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка запрета на ветвление в одном чате от сообщения из другого чата."""
+    root_id_chat_a = initial_chat_setup["root_message_id"]
+    chat_b_id = str(uuid.uuid4())
+
+    session.add(Chat(id=chat_b_id, title="Isolated Chat B"))
+    await session.commit()
+
+    with pytest.raises(MessageNotFoundError):
+        await branch_from_here(
+            chat_id=chat_b_id,
+            target_message_id=root_id_chat_a,
+            new_branch_name="hijack-branch",
+            session=session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_context_includes_merge_event_polymorphism(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    """Проверка корректной полиморфной загрузки MergeEvent внутри истории ветки."""
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+
+    merge_id = str(uuid.uuid4())
+    u2_id = str(uuid.uuid4())
+
+    merge_node = MergeEvent(
+        id=merge_id,
+        chat_id=chat_id,
+        parent_id=root_id,
+        role=MessageRole.SYSTEM_MERGE,
+        content="Сжатый итог ветки",
+        source_branch_name="side-quest",
+        forked_from_msg_id=root_id,
+        compressed_messages_count=5,
+    )
+    session.add(merge_node)
+    await session.flush()
+
+    session.add(
+        Message(id=u2_id, chat_id=chat_id, parent_id=merge_id, role=MessageRole.USER, content="Идем дальше")
+    )
+
+    stmt = select(Branch).where(Branch.chat_id == chat_id, Branch.name == "main")
+    main_branch = (await session.execute(stmt)).scalar_one()
+    main_branch.head_message_id = u2_id
+    await session.commit()
+
+    timeline = await reconstruct_context(chat_id, "main", session)
+
+    assert len(timeline) == 3
+    assert isinstance(timeline[1], MergeEvent)
+    assert timeline[1].source_branch_name == "side-quest"
