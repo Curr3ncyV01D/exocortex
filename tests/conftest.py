@@ -12,13 +12,13 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from src.storage.database import Base
+from src.storage.database import Base, init_db
 from src.storage.models import Branch, Chat, Message, MessageRole
 
 
 @pytest_asyncio.fixture
 async def async_engine() -> AsyncGenerator[AsyncEngine, None]:
-    """Инициализация изолированного движка SQLite в оперативной памяти со статическим пулом."""
+    """Инициализация изолированного движка SQLite в оперативной памяти со статическим пулом и FTS5."""
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -32,8 +32,7 @@ async def async_engine() -> AsyncGenerator[AsyncEngine, None]:
         cursor.execute("PRAGMA foreign_keys = ON;")
         cursor.close()
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await init_db(engine)
 
     yield engine
 
