@@ -1,0 +1,141 @@
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from google.genai import types
+
+from src.agent.client import GeminiClient, map_messages_to_gemini
+from src.storage.models import MergeEvent, Message, MessageRole
+
+
+def test_map_messages_user_and_model() -> None:
+    """Проверка маппинга стандартных ролей USER и MODEL в формат google-genai."""
+    msg_user = Message(
+        id=str(uuid.uuid4()),
+        chat_id="chat-1",
+        role=MessageRole.USER,
+        content="Привет, ментор",
+    )
+    msg_model = Message(
+        id=str(uuid.uuid4()),
+        chat_id="chat-1",
+        role=MessageRole.MODEL,
+        content="Здравствуй. К делу.",
+    )
+
+    contents = map_messages_to_gemini([msg_user, msg_model])
+
+    assert len(contents) == 2
+    assert contents[0].role == "user"
+    assert contents[0].parts[0].text == "Привет, ментор"
+    assert contents[1].role == "model"
+    assert contents[1].parts[0].text == "Здравствуй. К делу."
+
+
+def test_map_messages_system_merge_formatting() -> None:
+    """Проверка оборачивания узла SYSTEM_MERGE в системный префикс с ролью user."""
+    merge_msg = MergeEvent(
+        id=str(uuid.uuid4()),
+        chat_id="chat-1",
+        role=MessageRole.SYSTEM_MERGE,
+        content="Итог: выбран FastAPI.",
+        source_branch_name="explore-fastapi",
+        forked_from_msg_id="root-1",
+        compressed_messages_count=10,
+    )
+
+    contents = map_messages_to_gemini([merge_msg])
+
+    assert len(contents) == 1
+    assert contents[0].role == "user"
+    expected_text = (
+        "[СИСТЕМНЫЙ УЗЕЛ: Слияние ветки 'explore-fastapi']\n"
+        "Итог: выбран FastAPI."
+    )
+    assert contents[0].parts[0].text == expected_text
+
+
+def test_map_messages_empty_list() -> None:
+    """Проверка обработки пустой истории сообщений."""
+    assert map_messages_to_gemini([]) == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_client_generate_step_calls_sdk() -> None:
+    """Проверка корректной передачи истории, промпта и тулов в асинхронный метод SDK."""
+    mock_response = MagicMock()
+    mock_response.text = "Ответ модели"
+
+    with patch("src.agent.client.genai.Client") as mock_genai_cls:
+        mock_sdk_instance = mock_genai_cls.return_value
+        mock_sdk_instance.aio.models.generate_content = AsyncMock(
+            return_value=mock_response
+        )
+
+        client = GeminiClient(api_key="test-key", model_name="gemini-2.0-flash")
+        dummy_contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="Тестовый запрос")],
+            )
+        ]
+
+        def dummy_tool(x: str) -> str:
+            return x
+
+        response = await client.generate_step(
+            contents=dummy_contents,
+            tools=[dummy_tool],
+            system_instruction="Системная директива",
+        )
+
+        assert response.text == "Ответ модели"
+        mock_sdk_instance.aio.models.generate_content.assert_awaited_once()
+
+        call_kwargs = mock_sdk_instance.aio.models.generate_content.call_args.kwargs
+        assert call_kwargs["model"] == "gemini-2.0-flash"
+        assert call_kwargs["contents"] == dummy_contents
+        config: types.GenerateContentConfig = call_kwargs["config"]
+        assert config.system_instruction == "Системная директива"
+        assert config.tools == [dummy_tool]
+
+
+@pytest.mark.asyncio
+async def test_gemini_client_summarize_delta_formats_prompt() -> None:
+    """Проверка формирования контекстного моста при инкрементальной суммаризации дельты."""
+    mock_response = MagicMock()
+    mock_response.text = "  Сжатый итог ветки.  "
+
+    delta = [
+        Message(
+            id=str(uuid.uuid4()),
+            chat_id="chat-1",
+            role=MessageRole.USER,
+            content="Решили отказаться от Django?",
+        ),
+        Message(
+            id=str(uuid.uuid4()),
+            chat_id="chat-1",
+            role=MessageRole.MODEL,
+            content="Да, берем FastAPI.",
+        ),
+    ]
+
+    with patch("src.agent.client.genai.Client") as mock_genai_cls:
+        mock_sdk_instance = mock_genai_cls.return_value
+        mock_sdk_instance.aio.models.generate_content = AsyncMock(
+            return_value=mock_response
+        )
+
+        client = GeminiClient(api_key="test-key")
+        summary = await client.summarize_delta(
+            delta_messages=delta,
+            previous_summary="Ранее обсуждали выбор базы данных.",
+        )
+
+        assert summary == "Сжатый итог ветки."
+        call_kwargs = mock_sdk_instance.aio.models.generate_content.call_args.kwargs
+        prompt_sent: str = call_kwargs["contents"]
+        assert "Ранее обсуждали выбор базы данных." in prompt_sent
+        assert "Решили отказаться от Django?" in prompt_sent
+        assert "Да, берем FastAPI." in prompt_sent
