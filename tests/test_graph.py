@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.storage.crud_graph import (
+from src.storage.crud.graph import (
     BranchAlreadyExistsError,
     BranchNotFoundError,
     MessageNotFoundError,
