@@ -118,10 +118,10 @@ erDiagram
 | `compressed_messages_count` | `INTEGER` | `NOT NULL` | Общее количество реплик, вошедших в дельту сжатия. |
 
 ### 2.5. Виртуальная таблица `messages_fts` (Полнотекстовый индекс FTS5)
-Обеспечивает полнотекстовый поиск по всей глубине истории чата с поддержкой русской и английской морфологии.
+Обеспечивает детерминированный полнотекстовый поиск по всей глубине истории чата.
 
 ```sql
-CREATE VIRTUAL TABLE messages_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content='messages',
     content_rowid='rowid',
@@ -129,7 +129,8 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 ```
 
-* **Синхронизация:** Поддерживается через триггеры SQLite (`AFTER INSERT`, `AFTER UPDATE`, `AFTER DELETE` на таблице `messages`).
+* **Синхронизация:** Поддерживается автономно на уровне ядра SQLite через триггеры `AFTER INSERT`, `AFTER DELETE` и `AFTER UPDATE OF content` на базовой таблице `messages`.
+* **Морфология и санитизация:** Встроенный токенизатор `unicode61` не поддерживает русский стемминг из коробки. Компенсация регулярных падежных окончаний и защита от синтаксических инъекций (`AND`, `OR`, `NOT`, спецсимволы) реализованы в слое хранения (`src/storage/fts.py`) через класс `FTSQueryBuilder` (отсечение суффиксов + префиксный поиск `term*`).
 
 ## 3. Механизм полиморфного маппинга (SQLAlchemy 2.0)
 

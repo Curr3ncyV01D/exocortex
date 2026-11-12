@@ -1,7 +1,7 @@
-# Спецификация графового ядра: `src/storage/crud_graph.py`
+# Спецификация графового ядра: `src/storage/crud/graph.py`
 
 **Документ:** Архитектурная документация слоя манипуляции направленным ациклическим графом (DAG)  
-**Модуль:** `src.storage.crud_graph`  
+**Модуль:** `src.storage.crud/graph`  
 **Назначение:** Реализация базовых и графовых CRUD-операций, алгоритмов обхода дерева контекста, версионирования веток и инкрементального слияния.  
 **Стек:** Python 3.11+, SQLAlchemy 2.0 Async, aiosqlite.
 
@@ -9,7 +9,7 @@
 
 ## 1. Архитектурное назначение и границы модуля
 
-Модуль `crud_graph.py` является изолированным вычислительным ядром слоя хранения (`Storage Layer`). 
+Модуль `crud/graph.py` является изолированным вычислительным ядром слоя хранения (`Storage Layer`). 
 Он инкапсулирует всю бизнес-логику работы с реляционным представлением графа диалога, исключая утечку низкоуровневых SQL-запросов в сервисный слой API и слой ИИ-оркестратора.
 
 ### Базовые принципы реализации:
@@ -140,7 +140,7 @@ flowchart LR
 sequenceDiagram
     autonumber
     participant Caller as Сервисный слой / API
-    participant Graph as crud_graph.py
+    participant Graph as crud/graph.py
     participant Summarizer as Внешний суммаризатор (Callable)
     participant DB as SQLite Transaction
 
