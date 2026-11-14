@@ -68,7 +68,7 @@ erDiagram
     CHATS ||--o{ MESSAGES : "содержит"
     MESSAGES ||--o{ MESSAGES : "родитель (parent_id)"
     MESSAGES ||--o| MERGE_EVENTS : "расширяется (1 к 0..1)"
-    BRANCHES }o--|| MESSAGES : "указывает на head"
+    BRANCHES }o--o| MESSAGES : "указывает на head"
     BRANCHES }o--o| MESSAGES : "отпочкована от (forked_from)"
 
     CHATS {
@@ -103,6 +103,7 @@ erDiagram
 
     MERGE_EVENTS {
         string message_id PK, FK "Ссылка на messages.id"
+        string chat_id FK "Чат обеих ссылок слияния"
         string source_branch_name "Имя поглощенной ветки"
         string forked_from_msg_id FK "Узел исходного ветвления"
         integer compressed_messages_count "Объем сжатого пула реплик"
@@ -135,7 +136,7 @@ erDiagram
 | `id`              | `VARCHAR(36)` | `PRIMARY KEY`                                        | Уникальный идентификатор ветки (UUIDv4).                                 |
 | `chat_id`         | `VARCHAR(36)` | `FOREIGN KEY (chats.id) ON DELETE CASCADE, NOT NULL` | Привязка ветки к родительскому чату.                                     |
 | `name`            | `VARCHAR(64)` | `NOT NULL`                                           | Человеко-читаемое имя ветки (`main`, `feature/refactor`).                |
-| `head_message_id` | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NOT NULL`                | Указатель на текущее активное сообщение ветки.                           |
+| `head_message_id` | `VARCHAR(36)` | `FOREIGN KEY (chat_id, head_message_id), NULLABLE` | Вершина ветки. У новой пустой ветки значение `NULL`.                           |
 | `last_merged_message_id` | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NULLABLE` | Указывает на HEAD ветки в момент ее последнего слияния. Для новых веток = `NULL`. |
 | `forked_from_id`  | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NULLABLE`                | Исходный узел, от которого ветка была отпочкована (для `main` = `NULL`). |
 | `created_at`      | `DATETIME`    | `NOT NULL`                                           | Временная метка создания ветки (UTC).                                    |
@@ -168,6 +169,7 @@ erDiagram
 | Поле                        | Тип данных    | Ограничения                                                | Описание                                                        |
 | :-------------------------- | :------------ | :--------------------------------------------------------- | :-------------------------------------------------------------- |
 | `message_id`                | `VARCHAR(36)` | `PRIMARY KEY, FOREIGN KEY (messages.id) ON DELETE CASCADE` | Идентификатор базового узла сообщения.                          |
+| `chat_id` | `VARCHAR(36)` | `NOT NULL`, часть обоих составных FK на `messages` | Чат узла слияния и границы дельты. |
 | `source_branch_name`        | `VARCHAR(64)` | `NOT NULL`                                                 | Имя поглощенной побочной ветки.                                 |
 | `forked_from_msg_id`        | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NOT NULL`                      | Узел, на котором побочная ветка когда-то разделилась с целевой. |
 | `compressed_messages_count` | `INTEGER`     | `NOT NULL`                                                 | Число реплик побочной ветки, подвергнутых компрессии.           |
@@ -176,7 +178,7 @@ erDiagram
 
 #### 2.2.5. Виртуальная таблица `messages_fts` (Полнотекстовый поиск FTS5)
 
-Обеспечивает точный детерминированный поиск по истории чата с поддержкой русской морфологии без использования внешних векторных СУБД.
+Индексирует текст сообщений для префиксного поиска SQLite. Нормализация запроса и ограничения описаны в [документации агента](agent_core.md#32-полнотекстовый-поиск).
 
 ```sql
 CREATE VIRTUAL TABLE messages_fts USING fts5(
@@ -191,7 +193,7 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 
 ### 2.3. Системные инварианты и настройки СУБД
 
-Для гарантии ссылочной целостности графа (DAG), исключения взаимных блокировок при асинхронной работе FastAPI и оптимизации дискового ввода-вывода (I/O), на уровне инициализации асинхронного движка SQLAlchemy (`create_async_engine`) фиксируются следующие обязательные директивы SQLite:
+Для гарантии ссылочной целостности графа (DAG), параллельного чтения и оптимизации дискового ввода-вывода (I/O), на уровне инициализации асинхронного движка SQLAlchemy (`create_async_engine`) фиксируются следующие обязательные директивы SQLite:
 
 #### 2.3.1. Обязательные PRAGMA-директивы
 
@@ -210,11 +212,11 @@ PRAGMA cache_size = -64000;
 ```
 
 #### 2.3.2. Назначение директив:
-1.**Write-Ahead Logging (`WAL`):** Переводит SQLite в режим одновременного параллельного доступа: фоновые транзакции записи (добавление новых сообщений) физически **не блокируют** чтение графа (сборку контекста ветки). Ошибка `sqlite3.OperationalError: database is locked` полностью исключается.
+1.**Write-Ahead Logging (`WAL`):** Переводит SQLite в режим одновременного параллельного доступа: фоновые транзакции записи (добавление новых сообщений) физически **не блокируют** чтение графа (сборку контекста ветки). SQLite допускает одного писателя одновременно. При конкуренции возможна ошибка `SQLITE_BUSY`.
 
 2.**Включение внешних ключей (`foreign_keys = ON`):** По умолчанию в SQLite проверка внешних ключей отключена. Данная директива принудительно активирует контроль связей: база данных физически запретит создать узел с несуществующим `parent_id` или `chat_id`.
 
-3.**Режим синхронизации (`synchronous = NORMAL`):** В режиме WAL обеспечивает надежную защиту данных от повреждений при сбоях операционной системы, многократно сокращая задержки на дисковый `fsync()`.
+3.**Режим синхронизации (`synchronous = NORMAL`):** В режиме WAL сохраняет согласованность базы. При падении ОС или потере питания последние подтверждённые транзакции могут откатиться.
 
 #### 2.3.3. Программная конфигурация через SQLAlchemy 2.0
 Директивы инжектируются в каждое новое асинхронное соединение пула через событие `connect`:
@@ -237,13 +239,13 @@ def configure_sqlite_pragmas(dbapi_connection, connection_record):
 
 #### 2.3.4. Инварианты целостности данных:
 * **Инвариант ацикличности (DAG Acyclicity):** Запрещено создание циклических связей (`A -> B -> A`). Валидируется на уровне приложения: `parent_id` может указывать только на хронологически ранее созданный узел (`created_at_parent < created_at_child`).
-* **Контекстная чистота (Chat Boundary):** Сообщение-потомок обязано иметь тот же `chat_id`, что и его сообщение-родитель (`parent.chat_id == child.chat_id`). Межпространственные связи между чатами запрещены.
+* **Контекстная чистота (Chat Boundary):** Сообщение-потомок обязано иметь тот же `chat_id`, что и его сообщение-родитель (`parent.chat_id == child.chat_id`). Составные внешние ключи включают `chat_id` для родителя сообщения, указателей ветки и обеих ссылок события слияния. При чтении истории некорректная цепочка приводит к `GraphIntegrityError`.
 
 ---
 
 ## 3. Спецификация ключевых алгоритмов (Core Engine Logic)
 
-Все алгоритмы оперируют над направленным ациклическим графом (DAG) в базе данных SQLite и реализуются в модуле `src/storage/graph.py` с использованием асинхронной сессии SQLAlchemy 2.0 (`AsyncSession`).
+Все алгоритмы оперируют над направленным ациклическим графом (DAG) в базе данных SQLite и реализуются в модуле `src/storage/crud/graph.py` с использованием асинхронной сессии SQLAlchemy 2.0 (`AsyncSession`).
 
 ```mermaid
 flowchart TD
@@ -266,7 +268,7 @@ flowchart TD
   * `branch_name: str` — имя целевой ветки.
   * `session: AsyncSession` — сессия базы данных.
 * **Выходные данные:** `list[Message]` — исходные активные узлы в порядке истории.
-* **Временная сложность:** $O(K)$, где $K$ — глубина ветки (типично $K < 200$). Время выполнения в SQLite: $< 2$ мс.
+* **Временная сложность:** $O(K)$, где $K$ — глубина ветки.
 
 #### Пошаговая логика:
 1.По составному ключу `(chat_id, branch_name)` извлекается запись из таблицы `branches`. При отсутствии выбрасывается `BranchNotFoundError`.
@@ -276,7 +278,7 @@ flowchart TD
    * Если узел удовлетворяет условию **`msg.is_active == TRUE`**, он добавляется в `raw_chain`.
    * Указатель смещается на родительский узел: `curr_id = msg.parent_id`.
 4.Стек инвертируется для получения хронологического порядка: `timeline = list(reversed(raw_chain))`.
-Адаптер Gemini отдельно группирует смежные роли при построении `Content`. Для поиска агент использует идентификаторы всех активных узлов до группировки.
+Агент выбирает [скользящее окно](agent_core.md#33-скользящее-окно-контекста) из активных узлов. Адаптер Gemini группирует смежные роли при построении `Content`. Поиск исключает только идентификаторы узлов, вошедших в окно.
 
 ---
 
@@ -290,35 +292,7 @@ flowchart TD
   * `session: AsyncSession` — сессия БД.
 * **Предусловия:** Сообщение `target_message_id` существует и принадлежит `chat_id`. Имя `new_branch_name` не занято в рамках данного `chat_id`.
 
-```python
-async def branch_from_here(
-    chat_id: str, 
-    target_message_id: str, 
-    new_branch_name: str, 
-    session: AsyncSession
-) -> Branch:
-    # 1. Валидация существования целевого узла
-    target_msg = await session.get(Message, target_message_id)
-    if not target_msg or target_msg.chat_id != chat_id:
-        raise MessageNotFoundError(f"Узел {target_message_id} не найден в чате {chat_id}")
-
-    # 2. Проверка уникальности имени ветки в рамках чата
-    stmt_check = select(Branch).where(Branch.chat_id == chat_id, Branch.name == new_branch_name)
-    if (await session.execute(stmt_check)).scalar_one_or_none():
-        raise BranchAlreadyExistsError(f"Ветка '{new_branch_name}' уже существует в данном чате")
-
-    # 3. Атомарное создание указателя ветки
-    new_branch = Branch(
-        id=str(uuid.uuid4()),
-        chat_id=chat_id,
-        name=new_branch_name,
-        head_message_id=target_message_id,
-        forked_from_id=target_message_id
-    )
-    session.add(new_branch)
-    await session.flush()
-    return new_branch
-```
+Функция проверяет принадлежность узла чату и выполняет `INSERT … ON CONFLICT DO NOTHING RETURNING` по уникальной паре `(chat_id, name)`. При занятом имени возвращается `BranchAlreadyExistsError`. Вершина и точка ветвления указывают на исходный узел. Вызывающий код фиксирует транзакцию.
 
 ---
 
@@ -331,76 +305,19 @@ async def branch_from_here(
   * `force: bool = False` — флаг подтверждения мутации общего предка.
   * `session: AsyncSession` — сессия БД.
 
-```python
-async def update_message_content(
-    message_id: str, 
-    new_content: str, 
-    force: bool, 
-    session: AsyncSession
-) -> dict:
-    msg = await session.get(Message, message_id)
-    if not msg:
-        raise MessageNotFoundError(f"Сообщение {message_id} не найдено")
+При `force=False` рекурсивный запрос находит саму реплику и всех её потомков внутри чата. Затем ядро считает ветки, вершины которых входят в результат. Если текст совпадает с сохранённым, операция возвращает успех без изменения меток. Если затронуто больше одной ветки, функция возвращает `status="warning_required"`, `affected_branch_count` и сообщение. Запись сохраняет прежний текст.
 
-    # Проверка степени ветвления (количество прямых потомков)
-    stmt_children = select(func.count(Message.id)).where(Message.parent_id == message_id)
-    children_count = (await session.execute(stmt_children)).scalar() or 0
-
-    # Если узел разветвлен на несколько веток и не передан флаг force
-    if children_count > 1 and not force:
-        return {
-            "status": "warning_required",
-            "children_count": children_count,
-            "message": (
-                f"Узел является общим предком для {children_count} ветвлений. "
-                "Модификация изменит контекст во всех зависимых ветках и сбросит кэш. "
-                "Передайте force=True для подтверждения."
-            )
-        }
-
-    # Мутация контента с фиксацией инвариантов
-    msg.content = new_content
-    msg.is_edited = True
-    msg.updated_at = datetime.utcnow()  # Фиксируется строго при изменении текста
-    
-    await session.flush()
-    return {"status": "success", "message_id": message_id}
-```
+При подтверждении или правке в пределах одной ветки обновляются текст, `is_edited` и `updated_at`. Функция выполняет `flush()` и возвращает `status="success"` и `message_id`. Вызывающий код фиксирует транзакцию.
 
 ---
 
 ### Алгоритм 3.4: Сквош-Слияние веток (`squash_merge_branch`)
 **Назначение:** Семантическая компрессия побочной ветки силами вспомогательной LLM (Gemini) с добавлением синтетического узла `SYSTEM_MERGE` в целевую ветку.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client as API Client
-    participant Engine as graph.py
-    participant LLM as Gemini
-    participant DB as SQLite Transaction
-
-    Client->>Engine: squash_merge_branch(chat_id, source, target)
-    Engine->>DB: Изоляция дельты (от forked_from_id до head)
-    DB-->>Engine: Список реплик дельты
-    
-    Engine->>LLM: Аналитическая суммаризация дельты
-    LLM-->>Engine: Структурированный текст вывода (Summary)
-    
-    rect rgb(20, 30, 40)
-    Note over Engine,DB: Атомарная транзакция в БД
-    Engine->>DB: 1. INSERT Message(role=SYSTEM_MERGE, parent_id=target.head)
-    Engine->>DB: 2. INSERT MergeEvent(message_id, source, forked_from, count)
-    Engine->>DB: 3. UPDATE target.head_message_id = new_msg.id
-    Engine->>DB: 4. UPDATE source.status = 'merged'
-    DB-->>Engine: COMMIT OK
-    end
-    
-    Engine-->>Client: MergeResult (new_head_id, summary)
-```
+Последовательность записи и обработки конфликта показана в [спецификации графового ядра](spec_crud_graph.md#35-инкрементальное-сквош-слияние-squash_merge_branch).
 
 #### Пошаговая логика (Инкрементальное слияние):
-1. Извлекаются ветки `source` и `target` в рамках `chat_id`.
+1. Целью может быть только `main`. Слияние ветки в себя запрещено. После этих проверок ядро извлекает обе ветки в рамках `chat_id`.
 2. **Определение базового узла дельты:**
    * `start_node = source.last_merged_message_id IF source.last_merged_message_id IS NOT NULL ELSE source.forked_from_id`.
 3. **Изоляция активной дельты:** 
@@ -408,7 +325,7 @@ sequenceDiagram
    * Фильтруется массив активных сообщений: `active_delta = [m for m in delta if m.is_active]`.
    * **Валидация:** Если `len(active_delta) == 0`, слияние прерывается с ошибкой `400 Bad Request: "Нет новых активных сообщений с момента последнего слияния"`.
 4. **Контекстный мост (Prompt Bridge):** 
-   * Если ветка уже сливалась ранее, извлекается текст предыдущего узла слияния (`previous_summary`).
+   * Суммаризатор получает новую активную дельту и текст последней выжимки этой ветки (`previous_summary`), если она видима. Если последняя выжимка скрыта, передаётся `None`.
    * В Gemini передается промпт:
      ```text
      Роль: Аналитический суммаризатор дерева решений.
@@ -419,12 +336,13 @@ sequenceDiagram
      Формат: Не более 200 слов. Высокая плотность фактов.
      ```
 5. **Запись в транзакции вызывающего кода:**
+   * Пустая или пробельная выжимка отклоняется с `InvalidMergeError` до записи. Та же дельта остаётся доступной при повторной попытке.
    * После суммаризации атомарно проверяются вершины и точки последнего слияния обеих веток. При несовпадении выбрасывается `BranchConflictError`.
    * Создается `Message(role=SYSTEM_MERGE, parent_id=target.head_message_id, content=summary, chat_id=chat_id)`.
    * Создается `MergeEvent(message_id=new_msg.id, source_branch_name=source.name, forked_from_msg_id=start_node, compressed_messages_count=len(active_delta))`.
    * Сдвигается указатель целевой ветки: `target.head_message_id = new_msg.id`.
    * **Фиксация точки слияния:** `source.last_merged_message_id = source.head_message_id`.
-   * Ветка `source` **остается активной** (`status = "active"`), позволяя пользователю продолжать исследования.
+   * Статус исходной ветки сохраняется. Снятие маски со старой реплики возвращает её в контекст ветки. Граница уже обработанной дельты сохраняется.
 
 ---
 
@@ -436,19 +354,7 @@ sequenceDiagram
   * `session: AsyncSession` — сессия БД.
 * **Инвариант:** Поле `updated_at` **не модифицируется**, так как операция не изменяет смыслового наполнения текста (`content`), а управляет состоянием видимости.
 
-```python
-async def toggle_message_active(message_id: str, session: AsyncSession) -> bool:
-    msg = await session.get(Message, message_id)
-    if not msg:
-        raise MessageNotFoundError(f"Сообщение {message_id} не найдено")
-
-    # Инверсия флага присутствия в контексте
-    msg.is_active = not msg.is_active
-    
-    # updated_at намеренно НЕ изменяется (контент инвариантен)
-    await session.flush()
-    return msg.is_active
-```
+Ядро инвертирует `is_active` одним SQL-запросом `UPDATE … RETURNING`. При отсутствии сообщения оно возвращает `MessageNotFoundError`. Вызывающий код фиксирует транзакцию.
 
 ---
 
@@ -529,27 +435,7 @@ async def search_history_fts(
 #### 4.2.2. Инструмент `get_branch_summary`
 * **Назначение:** Эксплицитное извлечение итогов работы в ранее слитой побочной ветке.
 
-```python
-async def get_branch_summary(
-    chat_id: str,
-    branch_name: str,
-    session: AsyncSession
-) -> str:
-    """
-    Возвращает концентрированный аналитический вывод указанной слитой ветки.
-    """
-    stmt = (
-        select(MergeEvent.compressed_messages_count, Message.content)
-        .join(Message, MergeEvent.message_id == Message.id)
-        .where(
-            Message.chat_id == chat_id,
-            MergeEvent.source_branch_name == branch_name
-        )
-        .order_by(Message.created_at.desc())  # Возвращает последний инкрементальный срез
-        .limit(1)
-    )
-    # Возвращает текст аналитического сжатия из узла SYSTEM_MERGE...
-```
+Инструмент сначала выбирает последний `MergeEvent` по чату и имени исходной ветки. Если узел скрыт, инструмент отвечает «Актуальная сводка для ветки скрыта из контекста». Текст более ранних выжимок в этом случае не возвращается.
 
 ---
 
@@ -568,7 +454,7 @@ sequenceDiagram
 
     Client->>Orch: run_turn(chat_id, branch_name, prompt)
     Orch->>DB: 1. INSERT Message (role=USER) и COMMIT
-    Orch->>DB: 2. read_context_from_head(head_id, session)
+    Orch->>DB: 2. read_context_from_head(chat_id, head_id, session)
     DB-->>Orch: Возврат активной цепочки сообщений
 
     Note over Orch,Gemini: Эфимерный цикл в RAM (до 3 итераций)
@@ -602,7 +488,7 @@ sequenceDiagram
 
 ### 4.4. Протокол наблюдаемости (Observability & Tool Trace)
 
-Для обеспечения полной прозрачности логики модели и исключения эффекта «черного ящика», оркестратор упаковывает метаданные рассуждений в поле `metadata_json` финального сообщения.
+Оркестратор сохраняет события вызова инструментов и длительность хода в поле `metadata_json` финального сообщения.
 
 #### Структура схемы трассировки (`ExecutionTraceSchema`):
 ```json
@@ -658,7 +544,8 @@ flowchart LR
 
 ```python
 from datetime import datetime
-from typing import Optional, Any
+from typing import Any, Literal, Optional
+from uuid import UUID
 from pydantic import BaseModel, Field
 from enum import Enum
 
@@ -679,20 +566,20 @@ class ChatResponse(BaseModel):
 
 # --- Схемы веток ---
 class BranchCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64, regex="^[a-zA-Z0-9_-]+$")
+    name: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$")
     target_message_id: str = Field(..., description="ID узла, от которого создается форк")
 
 class BranchResponse(BaseModel):
     id: str
     chat_id: str
     name: str
-    head_message_id: str
+    head_message_id: Optional[str]
     forked_from_id: Optional[str]
     last_merged_message_id: Optional[str]
     created_at: datetime
 
 class BranchMergeRequest(BaseModel):
-    target_branch: str = Field(default="main", description="Целевая ветка поглощения")
+    target_branch: Literal["main"] = "main"
 
 class BranchMergeResponse(BaseModel):
     status: str = "success"
@@ -715,8 +602,22 @@ class MessageResponse(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime]
 
-class SendMessageRequest(BaseModel):
+class MessageCreateRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Текст пользовательского промпта")
+
+class GenerateReplyRequest(BaseModel):
+    expected_head_id: UUID
+
+class RegenerateReplyRequest(BaseModel):
+    expected_head_id: UUID
+    new_branch_name: str = Field(
+        ..., min_length=1, max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$",
+    )
+
+class RegenerateReplyResponse(BaseModel):
+    branch: BranchResponse
+    message: MessageResponse
 
 class MessageUpdateContentRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Новый текст сообщения")
@@ -729,7 +630,7 @@ class ToggleActiveResponse(BaseModel):
 # --- Схема ошибки предка (409 Conflict) ---
 class AncestorMutationWarningResponse(BaseModel):
     detail: str = "ANCESTOR_MUTATION_WARNING"
-    children_count: int
+    affected_branch_count: int
     message: str
 ```
 
@@ -737,11 +638,19 @@ class AncestorMutationWarningResponse(BaseModel):
 
 ### 5.2. Спецификация REST-эндпоинтов
 
+Маршруты описывают будущий транспорт FastAPI. Для генерации ожидаемая вершина должна быть активным сообщением пользователя. Для перегенерации ожидаемая вершина должна быть репликой модели с родительским сообщением пользователя. При сбое Gemini новая ветка уже сохранена и доступна для повторной генерации. Ответ об ошибке включает идентификаторы созданной ветки и её вершины.
+
+Маршруты адресуют ветку по `branch_id` (UUID). Имя ветки передаётся в теле запроса и может содержать `/`, например `feature/refactor`.
+
+`/run` передаёт обязательное поле `expected_head_id` в `run_turn()`. При несовпадении исходной вершины ядро возвращает `BranchConflictError` до вызова Gemini. При записи ответа ядро повторно проверяет вершину. Оба конфликта соответствуют HTTP `409`. В `/regenerate` транспорт проверяет исходную вершину в той же транзакции, в которой создаёт форк.
+
+Превышение бюджета накопленной истории обрабатывается [скользящим окном](agent_core.md#33-скользящее-окно-контекста). Если последняя активная реплика сама превышает `MAX_CONTEXT_BYTES`, транспорт возвращает `413 Payload Too Large` с предложением разбить реплику или увеличить лимит. Сохранённый текст остаётся целым.
+
 #### 5.2.1. Управление пространствами (Chats)
 
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/chats` | `ChatCreateRequest` | `201 Created` -> `ChatResponse` | Создает изолированный чат и инициализирует ветку `main`. |
+| `POST` | `/api/v1/chats` | `ChatCreateRequest` | `201 Created` -> `ChatResponse` | В одной транзакции создаёт чат и пустую ветку `main` с вершиной `null`. Первая записанная реплика становится корнем. |
 | `GET` | `/api/v1/chats` | *None* | `200 OK` -> `list[ChatResponse]` | Возвращает список всех чатов для отрисовки боковой панели. |
 
 ---
@@ -752,7 +661,7 @@ class AncestorMutationWarningResponse(BaseModel):
 | :--- | :--- | :--- | :--- | :--- |
 | `GET` | `/api/v1/chats/{chat_id}/branches` | *None* | `200 OK` -> `list[BranchResponse]` | Возвращает список всех существующих веток чата. |
 | `POST` | `/api/v1/chats/{chat_id}/branches` | `BranchCreateRequest` | `201 Created` -> `BranchResponse`<br>`404 Not Found` (узел не найден)<br>`409 Conflict` (имя занято) | Атомарное ветвление (`Branch from here`). Форк от сообщения. |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{name}/merge` | `BranchMergeRequest` | `200 OK` -> `BranchMergeResponse`<br>`400 Bad Request` (нет новых реплик)<br>`404 Not Found` (ветка не найдена) | Инкрементальное сквош-слияние побочной ветки в `main`. |
+| `POST` | `/api/v1/chats/{chat_id}/branches/{branch_id}/merge` | `BranchMergeRequest` | `200 OK` -> `BranchMergeResponse`<br>`400 Bad Request` (недопустимое слияние или нет активной дельты)<br>`404 Not Found` (ветка не найдена) | Инкрементальное сквош-слияние побочной ветки в `main`. |
 
 ---
 
@@ -760,7 +669,9 @@ class AncestorMutationWarningResponse(BaseModel):
 
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/chats/{chat_id}/branches/{name}/timeline` | *None* | `200 OK` -> `list[MessageResponse]` | Реконструирует цепочку активных сообщений ветки (Алгоритм 3.1). |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{name}/messages` | `SendMessageRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` (ветка занята генерацией)<br>`502 Bad Gateway` (ошибка API Gemini) | Отправка промпта, запуск цикла ReAct и возврат ответа с трассировкой. |
+| `GET` | `/api/v1/chats/{chat_id}/branches/{branch_id}/timeline` | *None* | `200 OK` -> `list[MessageResponse]` | Реконструирует цепочку активных сообщений ветки (Алгоритм 3.1). |
+| `POST` | `/api/v1/branches/{branch_id}/messages` | `MessageCreateRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя без запуска Gemini. Несколько таких запросов образуют цепочку. |
+| `POST` | `/api/v1/branches/{branch_id}/run` | `GenerateReplyRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (вершина изменилась, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на уже сохранённый вопрос с проверкой `expected_head_id`. После сбоя тот же запрос может повторить генерацию, пока вершина не изменилась. |
+| `POST` | `/api/v1/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки или нет ответа для перегенерации)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Автоматически создаёт форк от родителя текущего ответа модели и запускает генерацию в новой ветке. Исходный ответ остаётся в исходной ветке. |
 | `PATCH` | `/api/v1/messages/{message_id}` | `MessageUpdateContentRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` -> `AncestorMutationWarningResponse` | In-place правка текста (Алгоритм 3.3). Требует `force=True` для предков. |
 | `POST` | `/api/v1/messages/{message_id}/toggle-active` | *None* | `200 OK` -> `ToggleActiveResponse` | Контекстное маскирование (Алгоритм 3.5). Инвертирует флаг `is_active`. |

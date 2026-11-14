@@ -5,6 +5,7 @@ import pytest
 from google.genai import types
 
 from src.agent.client import GeminiClient, map_messages_to_gemini
+from src.config import settings
 from src.storage.models import MergeEvent, Message, MessageRole
 
 
@@ -60,6 +61,32 @@ def test_map_messages_empty_list() -> None:
     assert map_messages_to_gemini([]) == []
 
 
+def test_truncated_response_is_not_final() -> None:
+    response = types.GenerateContentResponse(candidates=[types.Candidate(
+        finish_reason=types.FinishReason.MAX_TOKENS,
+        content=types.Content(role="model", parts=[types.Part.from_text(text="Partial")]),
+    )])
+    assert GeminiClient.extract_response_text(response) == ""
+
+
+@pytest.mark.asyncio
+async def test_default_model_used_for_generation_and_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "configured-model")
+    with patch("src.agent.client.genai.Client") as sdk:
+        generate = AsyncMock(return_value=types.GenerateContentResponse())
+        sdk.return_value.aio.models.generate_content = generate
+        client = GeminiClient(api_key="test-key")
+        await client.generate_step([])
+        await client.summarize_delta([])
+
+    assert [call.kwargs["model"] for call in generate.await_args_list] == [
+        "configured-model",
+        "configured-model",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_gemini_client_generate_step_calls_sdk() -> None:
     """Проверка корректной передачи истории, промпта и тулов в асинхронный метод SDK."""
@@ -72,7 +99,7 @@ async def test_gemini_client_generate_step_calls_sdk() -> None:
             return_value=mock_response
         )
 
-        client = GeminiClient(api_key="test-key", model_name="gemini-2.0-flash")
+        client = GeminiClient(api_key="test-key", model_name="explicit-model")
         dummy_contents = [
             types.Content(
                 role="user",
@@ -93,7 +120,7 @@ async def test_gemini_client_generate_step_calls_sdk() -> None:
         mock_sdk_instance.aio.models.generate_content.assert_awaited_once()
 
         call_kwargs = mock_sdk_instance.aio.models.generate_content.call_args.kwargs
-        assert call_kwargs["model"] == "gemini-2.0-flash"
+        assert call_kwargs["model"] == "explicit-model"
         assert call_kwargs["contents"] == dummy_contents
         config: types.GenerateContentConfig = call_kwargs["config"]
         assert config.system_instruction == "Системная директива"
@@ -105,6 +132,7 @@ async def test_gemini_client_summarize_delta_formats_prompt() -> None:
     """Проверка формирования контекстного моста при инкрементальной суммаризации дельты."""
     mock_response = MagicMock()
     mock_response.text = "  Сжатый итог ветки.  "
+    mock_response.candidates = []
 
     delta = [
         Message(

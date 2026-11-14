@@ -7,6 +7,14 @@ from src.agent.tools import get_branch_summary, search_history_fts
 from src.storage.crud.graph import toggle_message_active, update_message_content
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 
+
+@pytest.mark.asyncio
+async def test_search_zero_limit_with_exclusions(session, initial_chat_setup):
+    assert await search_history_fts(
+        initial_chat_setup["chat_id"], "Root", exclude_message_ids=["other"],
+        session=session, limit=0,
+    ) == "Ничего не найдено."
+
 @pytest.mark.asyncio
 async def test_search_history_fts_morphology(
     session: AsyncSession,
@@ -61,6 +69,7 @@ async def test_search_history_fts_special_characters_safety(
     dangerous_queries = [
         "FastAPI-ORM",
         "C++",
+        "FastAPI_ORM",
         'NOT AND OR " " *',
         'query with "unclosed quotes',
     ]
@@ -72,7 +81,10 @@ async def test_search_history_fts_special_characters_safety(
             exclude_message_ids=[],
             session=session,
         )
-        assert isinstance(result, str)
+        if query in {"FastAPI-ORM", "C++", "FastAPI_ORM"}:
+            assert "FastAPI-ORM и C++" in result
+        else:
+            assert result == "Ничего не найдено."
 
 
 @pytest.mark.asyncio
@@ -170,6 +182,7 @@ async def test_get_branch_summary_returns_latest(
         source_branch_name="feature/test",
         forked_from_msg_id=event1.id,
         compressed_messages_count=5,
+        created_at=event1.created_at,
     )
     session.add(event2)
     await session.commit()
@@ -182,6 +195,12 @@ async def test_get_branch_summary_returns_latest(
 
     assert "Срез 2: Финальные выводы архитектуры" in summary
     assert "Срез 1" not in summary
+
+    await toggle_message_active(event2.id, session)
+    summary = await get_branch_summary(chat_id, "feature/test", session)
+    assert summary == "Актуальная сводка для ветки скрыта из контекста."
+    await toggle_message_active(event2.id, session)
+    assert "Срез 2" in await get_branch_summary(chat_id, "feature/test", session)
 
 
 @pytest.mark.asyncio

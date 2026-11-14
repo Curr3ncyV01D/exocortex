@@ -1,9 +1,11 @@
 import uuid
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import event
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -12,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from src.storage.database import Base, init_db
+from src.storage.database import Base, configure_sqlite_pragmas, init_db
 from src.storage.models import Branch, Chat, Message, MessageRole
 
 
@@ -43,6 +45,20 @@ async def async_engine() -> AsyncGenerator[AsyncEngine, None]:
 
 
 @pytest_asyncio.fixture
+async def file_sessions(
+    tmp_path: Path,
+) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    url = URL.create("sqlite+aiosqlite", database=str(tmp_path / "review.db"))
+    engine = create_async_engine(url)
+    event.listen(engine.sync_engine, "connect", configure_sqlite_pragmas)
+    try:
+        await init_db(engine)
+        yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
 async def session(
     async_engine: AsyncEngine,
 ) -> AsyncGenerator[AsyncSession, None]:
@@ -62,6 +78,10 @@ async def initial_chat_setup(
     session: AsyncSession,
 ) -> dict[str, str]:
     """Создает базовый чат с корневым сообщением и веткой main с гарантированным порядком flush."""
+    return await create_initial_chat(session)
+
+
+async def create_initial_chat(session: AsyncSession) -> dict[str, str]:
     chat_id = str(uuid.uuid4())
     root_msg_id = str(uuid.uuid4())
 

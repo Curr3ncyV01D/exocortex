@@ -1,4 +1,6 @@
 from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Корень проекта
@@ -11,6 +13,7 @@ class Settings(BaseSettings):
     # Ключ Gemini API
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
+    MAX_CONTEXT_BYTES: int = Field(default=512_000, gt=0)
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",

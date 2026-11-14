@@ -2,54 +2,213 @@ import asyncio
 import json
 import uuid
 from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy.exc import OperationalError
 from google.genai import types
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.agent.client import GeminiClient
-from src.agent.loop import BranchBusyError, LLMGenerationError, run_turn
+from src.agent.client import GeminiClient, map_messages_to_gemini
+from src.agent.loop import BranchBusyError, LLMGenerationError, PromptTooLargeError, run_turn
+from src.config import settings
 from src.storage.crud.chats import append_message
-from src.storage.crud.graph import branch_from_here
-from src.storage.models import Branch, Message, MessageRole
+from src.storage.crud.graph import BranchConflictError, branch_from_here, squash_merge_branch
+from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
+from tests.conftest import create_initial_chat
 
 
-def _make_text_response(text: Optional[str]) -> MagicMock:
-    """Создает мок-ответ SDK с финальным текстовым сообщением."""
-    resp = MagicMock(spec=types.GenerateContentResponse)
-    resp.function_calls = []
-    resp.text = text
-    content = (
-        types.Content(role="model", parts=[types.Part.from_text(text=text)])
-        if text is not None
-        else None
-    )
-    resp.candidates = [MagicMock(content=content)] if content else []
-    return resp
+def _make_text_response(text: Optional[str]) -> types.GenerateContentResponse:
+    if text is None:
+        return types.GenerateContentResponse()
+    return types.GenerateContentResponse(candidates=[types.Candidate(
+        finish_reason=types.FinishReason.STOP,
+        content=types.Content(role="model", parts=[types.Part.from_text(text=text)]),
+    )])
 
 
 def _make_tool_call_response(
     calls: list[tuple[str, dict[str, Any]]],
-) -> MagicMock:
-    """Создает мок-ответ SDK с запросом на вызов одного или нескольких инструментов."""
-    resp = MagicMock(spec=types.GenerateContentResponse)
-    call_mocks = []
-    parts = []
-    for name, args in calls:
-        c = MagicMock()
-        c.name = name
-        c.args = args
-        call_mocks.append(c)
-        parts.append(types.Part.from_function_call(name=name, args=args))
-
-    resp.function_calls = call_mocks
-    resp.text = None
-    resp.candidates = [
-        MagicMock(content=types.Content(role="model", parts=parts))
+) -> types.GenerateContentResponse:
+    parts = [
+        types.Part(function_call=types.FunctionCall(name=name, args=args, id=f"call-{index}"))
+        for index, (name, args) in enumerate(calls)
     ]
-    return resp
+    return types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(role="model", parts=parts),
+    )])
+
+
+@pytest.mark.asyncio
+async def test_blank_prompt_does_not_call_gemini(session, initial_chat_setup):
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(ValueError, match="Промпт"):
+            await run_turn(initial_chat_setup["chat_id"], "main", client, session, "  ")
+        client.generate_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turn_deadline_releases_lock_and_keeps_question(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+
+        async def slow_generation(**kwargs):
+            await asyncio.sleep(1)
+
+        client.generate_step = AsyncMock(side_effect=slow_generation)
+        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 0.25)
+        with pytest.raises(LLMGenerationError, match="лимит времени"):
+            await run_turn(chat_id, "main", client, session, "Question")
+        assert not session.in_transaction()
+        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 90)
+        client.generate_step = AsyncMock(return_value=_make_text_response("Recovered"))
+        answer = await run_turn(chat_id, "main", client, session)
+        question = await session.get(Message, answer.parent_id)
+        assert question is not None and question.content == "Question"
+
+
+@pytest.mark.asyncio
+async def test_turn_budget_rejects_oversized_latest_message(session, initial_chat_setup, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", 1)
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(PromptTooLargeError, match="MAX_CONTEXT_BYTES"):
+            await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+        client.generate_step.assert_not_awaited()
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_fts(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 200, session)
+    orphan = await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
+    hot_text = "Последний вопрос об ArchiveMarker"
+    latest = await append_message(chat_id, "main", MessageRole.USER, hot_text, session)
+    latest_id = latest.id
+    budget = _contents_size(map_messages_to_gemini([orphan, latest])) + 1500
+    # Make the older message larger than the remaining budget even before the orphan is removed.
+    await session.commit()
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
+    requests = []
+
+    async def generate(*, contents, tools):
+        requests.append([item.model_copy(deep=True) for item in contents])
+        if len(requests) == 1:
+            return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
+        return _make_text_response("Recovered")
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=generate)
+        answer = await run_turn(chat_id, "main", client, session)
+
+    assert answer.parent_id == latest_id
+    assert [item.role for item in requests[0]] == ["user"]
+    assert [part.text for part in requests[0][0].parts] == [hot_text]
+    tool_result = requests[1][-1].parts[0].function_response
+    assert "ArchiveMarker" in tool_result.response["result"]
+    assert hot_text not in tool_result.response["result"]
+    assert all(_contents_size(request) <= budget for request in requests)
+
+
+def _contents_size(contents: list[types.Content]) -> int:
+    return sum(len(item.model_dump_json().encode("utf-8")) for item in contents)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [True, False])
+async def test_run_turn_checks_client_head_before_writing_or_generating(
+    session: AsyncSession, initial_chat_setup: dict[str, str], matches: bool,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    head_id = initial_chat_setup["root_message_id"]
+    expected = head_id if matches else str(uuid.uuid4())
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(return_value=_make_text_response("Reply"))
+        if matches:
+            answer = await run_turn(chat_id, "main", client, session, expected_head_id=expected)
+            assert answer.parent_id == head_id
+            client.generate_step.assert_awaited_once()
+        else:
+            with pytest.raises(BranchConflictError):
+                await run_turn(
+                    chat_id, "main", client, session, user_prompt="Unwritten",
+                    expected_head_id=expected,
+                )
+            client.generate_step.assert_not_awaited()
+            ids = await session.scalars(select(Message.id).where(Message.chat_id == chat_id))
+            assert ids.all() == [head_id]
+
+
+@pytest.mark.asyncio
+async def test_prompt_exact_utf8_budget_and_tool_batch_overflow(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    prompt = "Кириллица 🧪"
+    only_prompt = map_messages_to_gemini([Message(role=MessageRole.USER, content=prompt)])
+    budget = _contents_size(only_prompt)
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget - 1)
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(PromptTooLargeError):
+            await run_turn(chat_id, "main", client, session, user_prompt=prompt)
+        client.generate_step.assert_not_awaited()
+        assert not session.in_transaction()
+
+        monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([("search_history", {"query": "Root"})]),
+            _make_text_response("Reply"),
+        ])
+        answer = await run_turn(
+            chat_id, "main", client, session, user_prompt=prompt,
+            expected_head_id=initial_chat_setup["root_message_id"],
+        )
+
+    question = await session.get(Message, answer.parent_id)
+    assert question is not None and question.content == prompt
+    assert question.parent_id == initial_chat_setup["root_message_id"]
+    assert client.generate_step.await_count == 2
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    for call in client.generate_step.await_args_list:
+        assert call.kwargs["contents"] == only_prompt
+
+
+@pytest.mark.asyncio
+async def test_turn_call_limit_falls_back_without_running_excess_batch(
+    session, initial_chat_setup, monkeypatch,
+):
+    monkeypatch.setattr("src.agent.loop.MAX_TOOL_CALLS", 1)
+    with patch("src.agent.client.genai.Client"), patch(
+        "src.agent.loop.search_history_fts", new_callable=AsyncMock,
+    ) as search:
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([
+                ("search_history", {"query": "one"}),
+                ("search_history", {"query": "two"}),
+            ]),
+            _make_text_response("Fallback"),
+        ])
+        answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+    assert answer.content == "Fallback"
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -110,6 +269,7 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
         content="Исторический факт: проект написан на FastAPI.",
         session=session,
     )
+    await session.commit()
 
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
@@ -138,6 +298,33 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
     assert trace["steps"][0]["tool_called"] == "search_history"
     assert trace["steps"][0]["arguments"] == {"query": "FastAPI"}
     assert "FastAPI" in trace["steps"][0]["output_summary"]
+    history = client.generate_step.await_args_list[1].kwargs["contents"]
+    assert history[-1].parts[0].function_response.id == "call-0"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_excludes_every_context_node_from_search(
+    session: AsyncSession,
+    initial_chat_setup: dict[str, str],
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    first = await append_message(chat_id, "main", MessageRole.MODEL, "Archive first", session)
+    second = await append_message(chat_id, "main", MessageRole.MODEL, "Archive second", session)
+    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id]
+    await session.commit()
+
+    with patch("src.agent.client.genai.Client"), patch(
+        "src.agent.loop.search_history_fts", new_callable=AsyncMock,
+        return_value="Ничего не найдено.",
+    ) as search:
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([("search_history", {"query": "Archive"})]),
+            _make_text_response("Ответ"),
+        ])
+        await run_turn(chat_id, "main", client, session)
+
+    assert search.await_args.kwargs["exclude_message_ids"] == expected_ids
 
 
 @pytest.mark.asyncio
@@ -208,34 +395,148 @@ async def test_run_turn_max_iterations_fallback(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_api_failure_preserves_user_message(
-    session: AsyncSession,
-    initial_chat_setup: dict[str, str],
+async def test_run_turn_does_not_commit_callers_open_transaction(
+    file_sessions: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Проверка Варианта Б: при сбое Gemini сообщение пользователя сохраняется в БД."""
-    chat_id = initial_chat_setup["chat_id"]
+    async with file_sessions() as session:
+        chat_id = (await create_initial_chat(session))["chat_id"]
+        chat = await session.get(Chat, chat_id)
+        assert chat is not None
+        chat.title = "Pending title"
+        await session.flush()
 
+        with patch("src.agent.client.genai.Client"):
+            client = GeminiClient(api_key="test-key")
+            client.generate_step = AsyncMock()
+            with pytest.raises(ValueError, match="без открытой транзакции"):
+                await run_turn(chat_id, "main", client, session, user_prompt="Question")
+            client.generate_step.assert_not_awaited()
+
+        await session.rollback()
+
+    async with file_sessions() as session:
+        chat = await session.get(Chat, chat_id)
+        assert chat is not None and chat.title == "Test Chat"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_api_failure_preserves_user_message(
+    file_sessions: async_sessionmaker[AsyncSession],
+) -> None:
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
         client.generate_step = AsyncMock(
-            side_effect=RuntimeError("503 Gemini Service Unavailable")
+            side_effect=[
+                RuntimeError("503 Gemini Service Unavailable"),
+                _make_text_response("Ответ после сбоя"),
+            ]
         )
 
-        with pytest.raises(LLMGenerationError):
-            await run_turn(
-                chat_id=chat_id,
-                branch_name="main",
-                client=client,
-                session=session,
-                user_prompt="Важная надиктованная мысль",
+        async with file_sessions() as session:
+            setup = await create_initial_chat(session)
+            chat_id = setup["chat_id"]
+            with pytest.raises(LLMGenerationError):
+                await run_turn(
+                    chat_id=chat_id,
+                    branch_name="main",
+                    client=client,
+                    session=session,
+                    user_prompt="Важная надиктованная мысль",
+                )
+
+        stmt = select(Branch).where(Branch.chat_id == chat_id, Branch.name == "main")
+        async with file_sessions() as session:
+            branch = (await session.execute(stmt)).scalar_one()
+            head_msg = await session.get(Message, branch.head_message_id)
+            assert head_msg is not None
+            assert head_msg.role == MessageRole.USER
+            assert head_msg.content == "Важная надиктованная мысль"
+            assert head_msg.parent_id == setup["root_message_id"]
+            user_message_id = head_msg.id
+
+        async with file_sessions() as session:
+            answer = await run_turn(chat_id, "main", client, session)
+            answer_id = answer.id
+
+        async with file_sessions() as session:
+            branch = (await session.execute(stmt)).scalar_one()
+            assert branch.head_message_id == answer_id
+            assert (await session.get(Message, answer_id)).parent_id == user_message_id
+
+
+@pytest.mark.asyncio
+async def test_run_turn_rejects_head_changed_by_merge(
+    file_sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with file_sessions() as session:
+        setup = await create_initial_chat(session)
+        chat_id = setup["chat_id"]
+        await branch_from_here(chat_id, setup["root_message_id"], "side", session)
+        await append_message(chat_id, "side", MessageRole.USER, "Side delta", session)
+        await session.commit()
+
+    async def generate_after_merge(**kwargs):
+        assert not session.in_transaction()
+        async with file_sessions() as writer:
+            await squash_merge_branch(
+                chat_id, "side", summarizer_func=AsyncMock(return_value="Summary"), session=writer,
+            )
+            await writer.commit()
+        return _make_text_response("Stale reply")
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=generate_after_merge)
+        async with file_sessions() as session:
+            with pytest.raises(BranchConflictError):
+                await run_turn(chat_id, "main", client, session, user_prompt="Question")
+
+    async with file_sessions() as session:
+        branches = {
+            branch.name: branch
+            for branch in await session.scalars(select(Branch).where(Branch.chat_id == chat_id))
+        }
+        merge = (await session.scalars(select(MergeEvent))).one()
+        assert branches["main"].head_message_id == merge.id
+        assert branches["side"].last_merged_message_id == branches["side"].head_message_id
+        assert (await session.get(Message, merge.parent_id)).content == "Question"
+        assert await session.scalar(select(Message.id).where(Message.content == "Stale reply")) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_branch", ["main", "side"])
+async def test_merge_rejects_branch_changed_during_summary(
+    file_sessions: async_sessionmaker[AsyncSession],
+    changed_branch: str,
+) -> None:
+    async with file_sessions() as session:
+        setup = await create_initial_chat(session)
+        chat_id = setup["chat_id"]
+        await branch_from_here(chat_id, setup["root_message_id"], "side", session)
+        await append_message(chat_id, "side", MessageRole.USER, "Side delta", session)
+        await session.commit()
+
+    async def summarize_after_append(delta, previous_summary=None):
+        async with file_sessions() as writer:
+            await append_message(chat_id, changed_branch, MessageRole.USER, "Concurrent update", writer)
+            await writer.commit()
+        return "Stale summary"
+
+    with pytest.raises(BranchConflictError):
+        async with file_sessions.begin() as session:
+            await squash_merge_branch(
+                chat_id, "side", summarizer_func=summarize_after_append, session=session,
             )
 
-    stmt = select(Branch).where(Branch.chat_id == chat_id, Branch.name == "main")
-    branch = (await session.execute(stmt)).scalar_one()
-    head_msg = await session.get(Message, branch.head_message_id)
-    assert head_msg is not None
-    assert head_msg.role == MessageRole.USER
-    assert head_msg.content == "Важная надиктованная мысль"
+    async with file_sessions() as session:
+        branches = {
+            branch.name: branch
+            for branch in await session.scalars(select(Branch).where(Branch.chat_id == chat_id))
+        }
+        head = await session.get(Message, branches[changed_branch].head_message_id)
+        assert head is not None and head.content == "Concurrent update"
+        assert branches["side"].last_merged_message_id is None
+        assert await session.scalar(select(MergeEvent.id)) is None
 
 
 @pytest.mark.asyncio
@@ -253,6 +554,7 @@ async def test_run_turn_retry_without_prompt_uses_existing_head(
         content="Второе сообщение цепочки",
         session=session,
     )
+    await session.commit()
 
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
@@ -303,6 +605,31 @@ async def test_run_turn_empty_or_blocked_model_response_raises_error(
 
 
 @pytest.mark.asyncio
+async def test_tool_failure_keeps_database_details_in_local_logs(
+    session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    details = OperationalError("SELECT local_marker", {"param": "private_marker"}, RuntimeError())
+    with patch("src.agent.client.genai.Client"), patch(
+        "src.agent.loop.search_history_fts", new=AsyncMock(side_effect=details),
+    ):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([("search_history", {"query": "example"})]),
+            _make_text_response("Ответ после сбоя инструмента"),
+        ])
+        answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+
+    followup = client.generate_step.await_args_list[1].kwargs["contents"][-1]
+    output = followup.parts[0].function_response.response["result"]
+    trace = json.loads(answer.metadata_json)["execution_trace"]["steps"][0]
+    assert "Ошибка" in output
+    assert trace["output_summary"] == output
+    for marker in ("local_marker", "private_marker"):
+        assert marker not in output
+        assert marker in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_run_turn_unknown_tool_graceful_recovery(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
@@ -334,15 +661,15 @@ async def test_run_turn_unknown_tool_graceful_recovery(
 
 @pytest.mark.asyncio
 async def test_run_turn_concurrent_branch_lock_raises_busy(
-    session: AsyncSession,
-    initial_chat_setup: dict[str, str],
+    file_sessions: async_sessionmaker[AsyncSession],
 ) -> None:
     """Проверка защиты ветки от одновременного запуска двух генераций (BranchBusyError)."""
-    chat_id = initial_chat_setup["chat_id"]
+    async with file_sessions() as session:
+        chat_id = (await create_initial_chat(session))["chat_id"]
     generation_started = asyncio.Event()
     allow_finish = asyncio.Event()
 
-    async def slow_generate(*args: Any, **kwargs: Any) -> MagicMock:
+    async def slow_generate(*args: Any, **kwargs: Any) -> types.GenerateContentResponse:
         generation_started.set()
         await allow_finish.wait()
         return _make_text_response("Ответ первого запроса")
@@ -351,25 +678,14 @@ async def test_run_turn_concurrent_branch_lock_raises_busy(
         client = GeminiClient(api_key="test-key")
         client.generate_step = AsyncMock(side_effect=slow_generate)
 
-        task1 = asyncio.create_task(
-            run_turn(
-                chat_id=chat_id,
-                branch_name="main",
-                client=client,
-                session=session,
-                user_prompt="Первый запрос",
+        async with file_sessions() as first, file_sessions() as second:
+            task = asyncio.create_task(
+                run_turn(chat_id, "main", client, first, user_prompt="Первый запрос")
             )
-        )
-        await generation_started.wait()
-
-        with pytest.raises(BranchBusyError):
-            await run_turn(
-                chat_id=chat_id,
-                branch_name="main",
-                client=client,
-                session=session,
-                user_prompt="Второй параллельный запрос",
-            )
-
-        allow_finish.set()
-        await task1
+            try:
+                await asyncio.wait_for(generation_started.wait(), timeout=5)
+                with pytest.raises(BranchBusyError):
+                    await run_turn(chat_id, "main", client, second, user_prompt="Второй запрос")
+            finally:
+                allow_finish.set()
+                await asyncio.wait_for(task, timeout=5)
