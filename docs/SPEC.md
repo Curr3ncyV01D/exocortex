@@ -278,7 +278,7 @@ flowchart TD
    * Если узел удовлетворяет условию **`msg.is_active == TRUE`**, он добавляется в `raw_chain`.
    * Указатель смещается на родительский узел: `curr_id = msg.parent_id`.
 4.Стек инвертируется для получения хронологического порядка: `timeline = list(reversed(raw_chain))`.
-Адаптер Gemini отдельно группирует смежные роли при построении `Content`. Для поиска агент использует идентификаторы всех активных узлов до группировки.
+Агент выбирает [скользящее окно](agent_core.md#33-скользящее-окно-контекста) из активных узлов. Адаптер Gemini группирует смежные роли при построении `Content`. Поиск исключает только идентификаторы узлов, вошедших в окно.
 
 ---
 
@@ -545,6 +545,7 @@ flowchart LR
 ```python
 from datetime import datetime
 from typing import Any, Literal, Optional
+from uuid import UUID
 from pydantic import BaseModel, Field
 from enum import Enum
 
@@ -605,10 +606,10 @@ class MessageCreateRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Текст пользовательского промпта")
 
 class GenerateReplyRequest(BaseModel):
-    expected_head_id: str
+    expected_head_id: UUID
 
 class RegenerateReplyRequest(BaseModel):
-    expected_head_id: str
+    expected_head_id: UUID
     new_branch_name: str = Field(
         ..., min_length=1, max_length=64,
         pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$",
@@ -639,7 +640,11 @@ class AncestorMutationWarningResponse(BaseModel):
 
 Маршруты описывают будущий транспорт FastAPI. Для генерации ожидаемая вершина должна быть активным сообщением пользователя. Для перегенерации ожидаемая вершина должна быть репликой модели с родительским сообщением пользователя. При сбое Gemini новая ветка уже сохранена и доступна для повторной генерации. Ответ об ошибке включает идентификаторы созданной ветки и её вершины.
 
-Маршруты адресуют ветку по `branch_id`. Имя ветки передаётся в теле запроса и может содержать `/`, например `feature/refactor`.
+Маршруты адресуют ветку по `branch_id` (UUID). Имя ветки передаётся в теле запроса и может содержать `/`, например `feature/refactor`.
+
+`/run` передаёт обязательное поле `expected_head_id` в `run_turn()`. При несовпадении исходной вершины ядро возвращает `BranchConflictError` до вызова Gemini. При записи ответа ядро повторно проверяет вершину. Оба конфликта соответствуют HTTP `409`. В `/regenerate` транспорт проверяет исходную вершину в той же транзакции, в которой создаёт форк.
+
+Превышение бюджета накопленной истории обрабатывается [скользящим окном](agent_core.md#33-скользящее-окно-контекста). Если последняя активная реплика сама превышает `MAX_CONTEXT_BYTES`, транспорт возвращает `413 Payload Too Large` с предложением разбить реплику или увеличить лимит. Сохранённый текст остаётся целым.
 
 #### 5.2.1. Управление пространствами (Chats)
 
@@ -665,8 +670,8 @@ class AncestorMutationWarningResponse(BaseModel):
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
 | `GET` | `/api/v1/chats/{chat_id}/branches/{branch_id}/timeline` | *None* | `200 OK` -> `list[MessageResponse]` | Реконструирует цепочку активных сообщений ветки (Алгоритм 3.1). |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{branch_id}/messages` | `MessageCreateRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя. Несколько таких запросов образуют цепочку. |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{branch_id}/generate` | `GenerateReplyRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (вершина изменилась, нет ожидающего вопроса или ветка занята)<br>`502 Bad Gateway` (сбой Gemini) | Запускает ответ для уже сохранённого вопроса. Тот же запрос после сбоя повторяет генерацию без записи вопроса. |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки или нет ответа для перегенерации)<br>`502 Bad Gateway` (сбой Gemini) | Создаёт ветку от родителя текущего ответа модели и генерирует там новый ответ. Исходный ответ остаётся в исходной ветке. |
+| `POST` | `/api/v1/branches/{branch_id}/messages` | `MessageCreateRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя без запуска Gemini. Несколько таких запросов образуют цепочку. |
+| `POST` | `/api/v1/branches/{branch_id}/run` | `GenerateReplyRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (вершина изменилась, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на уже сохранённый вопрос с проверкой `expected_head_id`. После сбоя тот же запрос может повторить генерацию, пока вершина не изменилась. |
+| `POST` | `/api/v1/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки или нет ответа для перегенерации)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Автоматически создаёт форк от родителя текущего ответа модели и запускает генерацию в новой ветке. Исходный ответ остаётся в исходной ветке. |
 | `PATCH` | `/api/v1/messages/{message_id}` | `MessageUpdateContentRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` -> `AncestorMutationWarningResponse` | In-place правка текста (Алгоритм 3.3). Требует `force=True` для предков. |
 | `POST` | `/api/v1/messages/{message_id}/toggle-active` | *None* | `200 OK` -> `ToggleActiveResponse` | Контекстное маскирование (Алгоритм 3.5). Инвертирует флаг `is_active`. |
