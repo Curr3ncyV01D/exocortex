@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     
     # Ключ Gemini API
     GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
