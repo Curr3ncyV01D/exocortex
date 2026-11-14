@@ -61,5 +61,7 @@ async def get_branch_summary(
     )
     if not event:
         return f"Сводка для ветки '{branch_name}' не найдена."
+    if not event.is_active:
+        return "Актуальная сводка для ветки скрыта из контекста."
 
     return f"Сводка ветки '{branch_name}': {event.content}"

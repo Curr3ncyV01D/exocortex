@@ -2,12 +2,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import literal_column, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
+    GraphIntegrityError,
+    message_belongs_to_chat,
     reserve_branch_write,
 )
 from src.storage.models import (
@@ -44,6 +46,8 @@ async def append_message(
     expected_head_id: Optional[str] = None,
 ) -> Message:
     """Добавляет реплику и обновляет ветку. Транзакцию завершает вызывающий код."""
+    if role not in (MessageRole.USER, MessageRole.MODEL):
+        raise ValueError("Обычная реплика должна иметь роль USER или MODEL.")
     branch = await get_branch(chat_id=chat_id, branch_name=branch_name, session=session)
     if not branch:
         raise BranchNotFoundError(
@@ -53,6 +57,8 @@ async def append_message(
     head_id = branch.head_message_id
     if expected_head_id is not None and head_id != expected_head_id:
         raise BranchConflictError("Состояние ветки изменилось. Повторите операцию.")
+    if not await message_belongs_to_chat(chat_id, head_id, session):
+        raise GraphIntegrityError(f"Некорректная вершина ветки в чате {chat_id}.")
     await reserve_branch_write(session, branch.id, head_id, branch.last_merged_message_id)
 
     msg_cls = ModelMessage if role == MessageRole.MODEL else Message
@@ -92,7 +98,8 @@ async def get_latest_merge_event(
             MergeEvent.chat_id == chat_id,
             MergeEvent.source_branch_name == branch_name,
         )
-        .order_by(MergeEvent.created_at.desc())
+        .order_by(MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+        .execution_options(populate_existing=True)
         .limit(1)
     )
     return (await session.execute(stmt)).scalar_one_or_none()

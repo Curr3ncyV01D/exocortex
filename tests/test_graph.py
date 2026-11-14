@@ -2,7 +2,8 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.agent.client import map_messages_to_gemini
@@ -10,6 +11,8 @@ from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
     BranchAlreadyExistsError,
     BranchNotFoundError,
+    GraphIntegrityError,
+    InvalidMergeError,
     MessageNotFoundError,
     NoActiveMessagesToMergeError,
     branch_from_here,
@@ -193,25 +196,10 @@ async def test_update_message_content_ancestor_warning(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
 ) -> None:
-    """Проверка срабатывания защиты при мутации узла с несколькими потомками (Алгоритм 3.3)."""
     chat_id = initial_chat_setup["chat_id"]
     root_id = initial_chat_setup["root_message_id"]
-
-    child1 = Message(
-        id=str(uuid.uuid4()),
-        chat_id=chat_id,
-        parent_id=root_id,
-        role=MessageRole.USER,
-        content="Child 1",
-    )
-    child2 = Message(
-        id=str(uuid.uuid4()),
-        chat_id=chat_id,
-        parent_id=root_id,
-        role=MessageRole.USER,
-        content="Child 2",
-    )
-    session.add_all([child1, child2])
+    await branch_from_here(chat_id, root_id, "side", session)
+    await append_message(chat_id, "main", MessageRole.USER, "Only child", session)
     await session.commit()
 
     result = await update_message_content(
@@ -222,7 +210,7 @@ async def test_update_message_content_ancestor_warning(
     )
 
     assert result["status"] == "warning_required"
-    assert result["children_count"] == 2
+    assert result["affected_branch_count"] == 2
 
     root_msg = await session.get(Message, root_id)
     assert root_msg.content == "Root prompt"
@@ -236,6 +224,7 @@ async def test_update_message_content_force_success(
 ) -> None:
     """Проверка принудительной мутации узла при передаче флага force=True."""
     root_id = initial_chat_setup["root_message_id"]
+    await branch_from_here(initial_chat_setup["chat_id"], root_id, "side", session)
 
     result = await update_message_content(
         message_id=root_id,
@@ -250,6 +239,132 @@ async def test_update_message_content_force_success(
     assert root_msg.content == "Force edited content"
     assert root_msg.is_edited is True
     assert root_msg.updated_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,target", [("main", "main"), ("side", "side"), ("side", "other")])
+async def test_merge_rejects_invalid_branches(
+    session: AsyncSession, initial_chat_setup: dict[str, str], source: str, target: str,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+    for name in ("side", "other"):
+        await branch_from_here(chat_id, root_id, name, session)
+    await append_message(chat_id, source, MessageRole.USER, "Delta", session)
+    summarizer = AsyncMock(return_value="Summary")
+
+    with pytest.raises(InvalidMergeError):
+        await squash_merge_branch(chat_id, source, target, summarizer, session)
+
+    summarizer.assert_not_awaited()
+    assert await session.scalar(select(MergeEvent.id)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["", "  \n", None])
+async def test_invalid_summary_preserves_delta_for_retry(
+    session: AsyncSession, initial_chat_setup: dict[str, str], summary: str | None,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+    side = await branch_from_here(chat_id, root_id, "side", session)
+    delta = await append_message(chat_id, "side", MessageRole.USER, "Delta", session)
+
+    with pytest.raises(InvalidMergeError):
+        await squash_merge_branch(
+            chat_id, "side", summarizer_func=AsyncMock(return_value=summary), session=session,
+        )
+
+    assert side.last_merged_message_id is None
+    assert await session.scalar(select(MergeEvent.id)) is None
+    assert [msg.id for msg in await reconstruct_context(chat_id, "main", session)] == [root_id]
+    summarizer = AsyncMock(return_value="Valid summary")
+    await squash_merge_branch(chat_id, "side", summarizer_func=summarizer, session=session)
+    summarizer.assert_awaited_once_with([delta])
+
+
+@pytest.mark.asyncio
+async def test_unmasked_message_before_merge_checkpoint_stays_out_of_delta(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    await branch_from_here(chat_id, initial_chat_setup["root_message_id"], "side", session)
+    old = await append_message(chat_id, "side", MessageRole.USER, "Old", session)
+    await toggle_message_active(old.id, session)
+    await append_message(chat_id, "side", MessageRole.USER, "First visible", session)
+    summary = AsyncMock(return_value="Summary")
+    await squash_merge_branch(chat_id, "side", summarizer_func=summary, session=session)
+
+    await toggle_message_active(old.id, session)
+    assert old.id in {msg.id for msg in await reconstruct_context(chat_id, "side", session)}
+    new = await append_message(chat_id, "side", MessageRole.USER, "New", session)
+    summary.reset_mock()
+    await squash_merge_branch(chat_id, "side", summarizer_func=summary, session=session)
+    summary.assert_awaited_once_with([new])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["head_message_id", "parent_id"])
+async def test_context_rejects_existing_cross_chat_link(
+    session: AsyncSession, initial_chat_setup: dict[str, str], link: str,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    foreign_root = (await create_initial_chat(session))["root_message_id"]
+    # Воспроизводим некорректную запись, оставленную схемой без составных ключей.
+    await session.execute(text("PRAGMA foreign_keys = OFF"))
+    if link == "head_message_id":
+        await session.execute(
+            text("UPDATE branches SET head_message_id = :foreign_root WHERE chat_id = :chat_id"),
+            {"foreign_root": foreign_root, "chat_id": chat_id},
+        )
+    else:
+        await session.execute(
+            text("UPDATE messages SET parent_id = :foreign_root WHERE chat_id = :chat_id"),
+            {"foreign_root": foreign_root, "chat_id": chat_id},
+        )
+    await session.commit()
+    await session.execute(text("PRAGMA foreign_keys = ON"))
+
+    with pytest.raises(GraphIntegrityError):
+        await reconstruct_context(chat_id, "main", session)
+
+
+@pytest.mark.asyncio
+async def test_append_rejects_system_merge_role(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    with pytest.raises(ValueError):
+        await append_message(chat_id, "main", MessageRole.SYSTEM_MERGE, "Incomplete merge", session)
+    assert [msg.id for msg in await reconstruct_context(chat_id, "main", session)] == [
+        initial_chat_setup["root_message_id"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["parent_id", "head_message_id", "forked_from_id",
+                                  "last_merged_message_id", "forked_from_msg_id"])
+async def test_db_rejects_cross_chat_graph_links(
+    session: AsyncSession, initial_chat_setup: dict[str, str], link: str,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    root_id = initial_chat_setup["root_message_id"]
+    foreign_root = (await create_initial_chat(session))["root_message_id"]
+    if link == "parent_id":
+        row = Message(chat_id=chat_id, parent_id=foreign_root, role=MessageRole.USER, content="Text")
+    elif link == "forked_from_msg_id":
+        row = MergeEvent(
+            chat_id=chat_id, parent_id=root_id, role=MessageRole.SYSTEM_MERGE,
+            content="Summary", source_branch_name="side", forked_from_msg_id=foreign_root,
+            compressed_messages_count=1,
+        )
+    else:
+        pointers = {"head_message_id": root_id, link: foreign_root}
+        row = Branch(chat_id=chat_id, name="side", **pointers)
+    session.add(row)
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()
 
 
 @pytest.mark.asyncio

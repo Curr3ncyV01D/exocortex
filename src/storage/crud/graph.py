@@ -35,6 +35,14 @@ class MessageNotFoundError(GraphEngineError):
     """Исключение: целевое сообщение не найдено."""
 
 
+class GraphIntegrityError(GraphEngineError):
+    """Сохранённые связи графа нарушают его инварианты."""
+
+
+class InvalidMergeError(GraphEngineError, ValueError):
+    """Слияние нарушает правила MVP или не получило текст выжимки."""
+
+
 class NoActiveMessagesToMergeError(GraphEngineError):
     """Исключение: отсутствуют активные сообщения для слияния ветки."""
 
@@ -77,23 +85,47 @@ async def reconstruct_context(
             f"Ветка '{branch_name}' не найдена в чате {chat_id}"
         )
 
-    return await read_context_from_head(branch.head_message_id, session)
+    return await read_context_from_head(chat_id, branch.head_message_id, session)
 
 
-async def read_context_from_head(head_id: str, session: AsyncSession) -> list[Message]:
+async def read_context_from_head(
+    chat_id: str, head_id: str, session: AsyncSession,
+) -> list[Message]:
     """Читает активные узлы от заданной вершины."""
-    curr_id: Optional[str] = head_id
-    active_messages: list[Message] = []
+    history = await _read_history(chat_id, head_id, session)
+    return [msg for msg in reversed(history) if msg.is_active]
 
-    while curr_id is not None:
+
+async def _read_history(
+    chat_id: str,
+    head_id: str,
+    session: AsyncSession,
+    *,
+    stop_id: Optional[str] = None,
+) -> list[Message]:
+    """Читает цепочку от вершины до границы, исключая саму границу."""
+    curr_id: Optional[str] = head_id
+    history: list[Message] = []
+    visited: set[str] = set()
+
+    while curr_id is not None and curr_id != stop_id:
         msg = await session.get(Message, curr_id)
-        if not msg:
-            break
-        if msg.is_active:
-            active_messages.append(msg)
+        if msg is None or msg.chat_id != chat_id or curr_id in visited:
+            raise GraphIntegrityError(f"Некорректная связь графа в чате {chat_id}.")
+        visited.add(curr_id)
+        history.append(msg)
         curr_id = msg.parent_id
 
-    return list(reversed(active_messages))
+    if stop_id is not None and (
+        curr_id != stop_id or not await message_belongs_to_chat(chat_id, stop_id, session)
+    ):
+        raise GraphIntegrityError(f"Некорректная граница слияния в чате {chat_id}.")
+    return history
+
+
+async def message_belongs_to_chat(chat_id: str, message_id: str, session: AsyncSession) -> bool:
+    message = await session.get(Message, message_id)
+    return message is not None and message.chat_id == chat_id
 
 
 async def branch_from_here(
@@ -103,8 +135,7 @@ async def branch_from_here(
     session: AsyncSession,
 ) -> Branch:
     """Создает ветку. Транзакцию завершает вызывающий код."""
-    target_msg = await session.get(Message, target_message_id)
-    if not target_msg or target_msg.chat_id != chat_id:
+    if not await message_belongs_to_chat(chat_id, target_message_id, session):
         raise MessageNotFoundError(
             f"Узел {target_message_id} не найден в чате {chat_id}"
         )
@@ -145,20 +176,28 @@ async def update_message_content(
     if not msg:
         raise MessageNotFoundError(f"Сообщение {message_id} не найдено")
 
-    stmt_children = select(func.count(Message.id)).where(
-        Message.parent_id == message_id
-    )
-    children_count = (await session.execute(stmt_children)).scalar() or 0
-
-    if children_count > 1 and not force:
-        return {
-            "status": "warning_required",
-            "children_count": children_count,
-            "message": (
-                f"Узел является общим предком для {children_count} ветвлений. "
-                "Передайте force=True для подтверждения мутации."
-            ),
-        }
+    if not force:
+        messages = Message.__table__
+        descendants = (
+            select(messages.c.id).where(messages.c.id == message_id)
+            .cte("descendants", recursive=True)
+        )
+        descendants = descendants.union(
+            select(messages.c.id)
+            .join(descendants, messages.c.parent_id == descendants.c.id)
+            .where(messages.c.chat_id == msg.chat_id)
+        )
+        count = await session.scalar(
+            select(func.count()).select_from(Branch)
+            .join(descendants, Branch.head_message_id == descendants.c.id)
+            .where(Branch.chat_id == msg.chat_id)
+        )
+        if count is not None and count > 1:
+            return {
+                "status": "warning_required",
+                "affected_branch_count": count,
+                "message": f"Правка затронет {count} веток. Передайте force=True для подтверждения.",
+            }
 
     msg.content = new_content
     msg.is_edited = True
@@ -192,6 +231,10 @@ async def squash_merge_branch(
     """Сливает активную дельту. Транзакцию завершает вызывающий код."""
     if session is None or summarizer_func is None:
         raise ValueError("Требуются сессия БД и функция суммаризации.")
+    if source_branch_name == target_branch_name:
+        raise InvalidMergeError("Нельзя слить ветку в саму себя.")
+    if target_branch_name != "main":
+        raise InvalidMergeError("Слияние разрешено только в main.")
 
     stmt_source = select(Branch).where(
         Branch.chat_id == chat_id,
@@ -214,24 +257,18 @@ async def squash_merge_branch(
     target_last_merged_id = target_branch.last_merged_message_id
     start_node_id = source_last_merged_id or source_branch.forked_from_id
 
-    delta_messages: list[Message] = []
-    curr_id: Optional[str] = source_head_id
-
-    while curr_id is not None and curr_id != start_node_id:
-        msg = await session.get(Message, curr_id)
-        if not msg:
-            break
-        delta_messages.append(msg)
-        curr_id = msg.parent_id
-
-    active_delta = [m for m in delta_messages if m.is_active]
+    if not await message_belongs_to_chat(chat_id, target_head_id, session):
+        raise GraphIntegrityError(f"Некорректная вершина целевой ветки в чате {chat_id}.")
+    delta = await _read_history(chat_id, source_head_id, session, stop_id=start_node_id)
+    active_delta = [msg for msg in reversed(delta) if msg.is_active]
     if not active_delta:
         raise NoActiveMessagesToMergeError(
             "Отсутствуют активные сообщения для слияния."
         )
 
-    active_delta_ordered = list(reversed(active_delta))
-    summary_text = await summarizer_func(active_delta_ordered)
+    summary_text = await summarizer_func(active_delta)
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        raise InvalidMergeError("Суммаризатор вернул пустую или некорректную выжимку.")
 
     await reserve_branch_write(
         session, source_branch.id, source_head_id, source_last_merged_id,

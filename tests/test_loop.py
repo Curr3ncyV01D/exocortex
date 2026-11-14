@@ -5,6 +5,7 @@ from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.exc import OperationalError
 from google.genai import types
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -442,6 +443,31 @@ async def test_run_turn_empty_or_blocked_model_response_raises_error(
     branch = (await session.execute(stmt)).scalar_one()
     head_msg = await session.get(Message, branch.head_message_id)
     assert head_msg.role == MessageRole.USER
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_keeps_database_details_in_local_logs(
+    session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    details = OperationalError("SELECT local_marker", {"param": "private_marker"}, RuntimeError())
+    with patch("src.agent.client.genai.Client"), patch(
+        "src.agent.loop.search_history_fts", new=AsyncMock(side_effect=details),
+    ):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([("search_history", {"query": "example"})]),
+            _make_text_response("Ответ после сбоя инструмента"),
+        ])
+        answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+
+    followup = client.generate_step.await_args_list[1].kwargs["contents"][-1]
+    output = followup.parts[0].function_response.response["result"]
+    trace = json.loads(answer.metadata_json)["execution_trace"]["steps"][0]
+    assert "Ошибка" in output
+    assert trace["output_summary"] == output
+    for marker in ("local_marker", "private_marker"):
+        assert marker not in output
+        assert marker in caplog.text
 
 
 @pytest.mark.asyncio

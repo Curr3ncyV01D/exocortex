@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from src.storage.crud.graph import BranchNotFoundError, read_context_from_head
 from src.storage.models import Message, MessageRole
 
 _branch_locks: dict[str, asyncio.Lock] = {}
+logger = logging.getLogger(__name__)
 
 
 class AgentLoopError(Exception):
@@ -69,7 +71,7 @@ async def run_turn(
                 await session.rollback()
                 raise
 
-        timeline = await read_context_from_head(head_id, session)
+        timeline = await read_context_from_head(chat_id, head_id, session)
         active_ids = [msg.id for msg in timeline]
         contents = map_messages_to_gemini(timeline)
 
@@ -140,10 +142,9 @@ async def run_turn(
                     seen_calls.add(call_sig)
                     try:
                         output_str = await tool_registry[tool_name](**tool_args)
-                    except Exception as exc:
-                        output_str = (
-                            f"Ошибка выполнения инструмента '{tool_name}': {exc}"
-                        )
+                    except Exception:
+                        logger.exception("Сбой инструмента %s", tool_name)
+                        output_str = "Ошибка выполнения инструмента. Продолжи без его результата."
 
                 step_duration_ms = round((time.perf_counter() - step_start) * 1000, 2)
                 tool_results.append((tool_name, output_str))

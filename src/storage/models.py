@@ -8,11 +8,13 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    and_,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -72,6 +74,15 @@ class Branch(Base):
     __tablename__ = "branches"
     __table_args__ = (
         UniqueConstraint("chat_id", "name", name="uq_chat_branch_name"),
+        ForeignKeyConstraint(
+            ["chat_id", "head_message_id"], ["messages.chat_id", "messages.id"],
+        ),
+        ForeignKeyConstraint(
+            ["chat_id", "last_merged_message_id"], ["messages.chat_id", "messages.id"],
+        ),
+        ForeignKeyConstraint(
+            ["chat_id", "forked_from_id"], ["messages.chat_id", "messages.id"],
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -87,17 +98,14 @@ class Branch(Base):
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     head_message_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("messages.id"),
         nullable=False,
     )
     last_merged_message_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("messages.id"),
         nullable=True,
     )
     forked_from_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("messages.id"),
         nullable=True,
     )
     status: Mapped[BranchStatus] = mapped_column(
@@ -123,6 +131,10 @@ class Message(Base):
 
     __tablename__ = "messages"
     __table_args__ = (
+        UniqueConstraint("chat_id", "id", name="uq_chat_message_id"),
+        ForeignKeyConstraint(
+            ["chat_id", "parent_id"], ["messages.chat_id", "messages.id"],
+        ),
         Index("idx_messages_parent_id", "parent_id"),
         Index("idx_messages_chat_id", "chat_id"),
     )
@@ -139,7 +151,6 @@ class Message(Base):
     )
     parent_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("messages.id"),
         nullable=True,
     )
     role: Mapped[MessageRole] = mapped_column(
@@ -171,6 +182,7 @@ class Message(Base):
     chat: Mapped["Chat"] = relationship("Chat", back_populates="messages")
     parent: Mapped[Optional["Message"]] = relationship(
         "Message",
+        foreign_keys=[parent_id],
         remote_side=[id],
         backref="children",
     )
@@ -194,16 +206,24 @@ class MergeEvent(Message):
     """Полиморфное расширение узла для фиксации факта слияния веток."""
 
     __tablename__ = "merge_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["chat_id", "message_id"], ["messages.chat_id", "messages.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["chat_id", "forked_from_msg_id"], ["messages.chat_id", "messages.id"],
+        ),
+    )
 
     message_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("messages.id", ondelete="CASCADE"),
         primary_key=True,
     )
+    merge_chat_id: Mapped[str] = mapped_column("chat_id", String(36), nullable=False)
     source_branch_name: Mapped[str] = mapped_column(String(64), nullable=False)
     forked_from_msg_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("messages.id"),
         nullable=False,
     )
     compressed_messages_count: Mapped[int] = mapped_column(
@@ -213,5 +233,7 @@ class MergeEvent(Message):
 
     __mapper_args__ = {
         "polymorphic_identity": MessageRole.SYSTEM_MERGE,
-        "inherit_condition": (message_id == Message.id),
+        "inherit_condition": and_(
+            message_id == Message.id, merge_chat_id == Message.chat_id,
+        ),
     }

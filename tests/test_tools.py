@@ -170,6 +170,7 @@ async def test_get_branch_summary_returns_latest(
         source_branch_name="feature/test",
         forked_from_msg_id=event1.id,
         compressed_messages_count=5,
+        created_at=event1.created_at,
     )
     session.add(event2)
     await session.commit()
@@ -182,6 +183,12 @@ async def test_get_branch_summary_returns_latest(
 
     assert "Срез 2: Финальные выводы архитектуры" in summary
     assert "Срез 1" not in summary
+
+    await toggle_message_active(event2.id, session)
+    summary = await get_branch_summary(chat_id, "feature/test", session)
+    assert summary == "Актуальная сводка для ветки скрыта из контекста."
+    await toggle_message_active(event2.id, session)
+    assert "Срез 2" in await get_branch_summary(chat_id, "feature/test", session)
 
 
 @pytest.mark.asyncio
