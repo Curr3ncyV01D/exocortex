@@ -29,7 +29,7 @@
 * **Иерархическую изоляцию пространств (Multi-Chat Scoping):** Разделение несвязанных тем (проекты, философия, спорт) по независимым контейнерам чатов без перекрестного загрязнения контекста.
 * **Граф диалога (DAG):** Хранение реплик как узлов направленного ациклического графа с древовидной структурой ссылок (`parent_id`) внутри каждого чата.
 * **Когнитивный Git (Branching & Forking):** Мгновенное отпочкование новой независимой ветки от любого исторического сообщения с изоляцией контекста.
-* **Инкрементальное сквош-слияние (Squash & Merge):** Семантическая компрессия побочной ветки силами легковесной модели (Gemini 2.0 Flash) в высокоплотный узел выводов (`system_merge`) и его вливание в целевую ветку ( например `main`) с сохранением непрерывности мысли через контекстный мост.
+* **Инкрементальное сквош-слияние (Squash & Merge):** Семантическая компрессия побочной ветки силами легковесной модели (Gemini) в высокоплотный узел выводов (`system_merge`) и его вливание в целевую ветку ( например `main`) с сохранением непрерывности мысли через контекстный мост.
 * **Селективное управление контекстом (Context Masking / Toggle):** Мгновенное включение/исключение любых реплик из контекста генерации тумблером `is_active` без физического разрушения связей графа и без потери данных.
 * **Свободу манипуляции узлами (Playground UX):** Возможность цепочечной отправки нескольких сообщений пользователя подряд, in-place редактирование текста с предупреждением о десинхронизации потомков и перегенерация ходов.
 
@@ -248,7 +248,7 @@ def configure_sqlite_pragmas(dbapi_connection, connection_record):
 ```mermaid
 flowchart TD
     subgraph EnginePipelines ["Конвейеры графового ядра"]
-        A1["3.1. reconstruct_context\n(Трейсбек + Санитизация ролей)"]
+        A1["3.1. reconstruct_context\n(Обход активных узлов)"]
         A2["3.2. branch_from_here\n(Атомарное создание ветки)"]
         A3["3.3. update_message_content\n(Правка с Ancestor Check)"]
         A4["3.4. squash_merge_branch\n(Компрессия и слияние)"]
@@ -265,7 +265,7 @@ flowchart TD
   * `chat_id: str` — идентификатор изолированного пространства диалога.
   * `branch_name: str` — имя целевой ветки.
   * `session: AsyncSession` — сессия базы данных.
-* **Выходные данные:** `list[dict]` — список активных реплик, санитизированный под требования Google GenAI SDK (`role`, `parts`).
+* **Выходные данные:** `list[Message]` — исходные активные узлы в порядке истории.
 * **Временная сложность:** $O(K)$, где $K$ — глубина ветки (типично $K < 200$). Время выполнения в SQLite: $< 2$ мс.
 
 #### Пошаговая логика:
@@ -276,49 +276,7 @@ flowchart TD
    * Если узел удовлетворяет условию **`msg.is_active == TRUE`**, он добавляется в `raw_chain`.
    * Указатель смещается на родительский узел: `curr_id = msg.parent_id`.
 4.Стек инвертируется для получения хронологического порядка: `timeline = list(reversed(raw_chain))`.
-5.**Санитизация ролей (Инвариант Gemini API):**  
-   Google GenAI SDK запрещает наличие двух подряд идущих сообщений с ролью `model`. Если в результате маскирования (`is_active = FALSE`) образовалась смежная последовательность `model -> model`, алгоритм объединяет их текстовые тела через разделитель `\n\n`, формируя единый логический ход.
-
-```python
-async def reconstruct_context(
-    chat_id: str, 
-    branch_name: str, 
-    session: AsyncSession
-) -> list[Message]:
-    stmt = select(Branch).where(Branch.chat_id == chat_id, Branch.name == branch_name)
-    branch = (await session.execute(stmt)).scalar_one_or_none()
-    if not branch:
-        raise BranchNotFoundError(f"Ветка '{branch_name}' не найдена в чате {chat_id}")
-
-    curr_id = branch.head_message_id
-    active_messages: list[Message] = []
-
-    while curr_id is not None:
-        msg = await session.get(Message, curr_id)
-        if not msg:
-            break
-        if msg.is_active:
-            active_messages.append(msg)
-        curr_id = msg.parent_id
-
-    # Хронологический порядок: [Root -> ... -> Head]
-    timeline = list(reversed(active_messages))
-    
-    # Санитизация ролей под требования API
-    sanitized_timeline: list[Message] = []
-    for msg in timeline:
-        if (
-            sanitized_timeline 
-            and sanitized_timeline[-1].role == MessageRole.MODEL 
-            and msg.role == MessageRole.MODEL
-        ):
-            # Склеиваем идущие подряд ответы модели
-            sanitized_timeline[-1].content += f"\n\n{msg.content}"
-        else:
-            sanitized_timeline.append(msg)
-
-    return sanitized_timeline
-```
+Адаптер Gemini отдельно группирует смежные роли при построении `Content`. Для поиска агент использует идентификаторы всех активных узлов до группировки.
 
 ---
 
@@ -358,8 +316,7 @@ async def branch_from_here(
         forked_from_id=target_message_id
     )
     session.add(new_branch)
-    await session.commit()
-    await session.refresh(new_branch)
+    await session.flush()
     return new_branch
 ```
 
@@ -406,21 +363,21 @@ async def update_message_content(
     msg.is_edited = True
     msg.updated_at = datetime.utcnow()  # Фиксируется строго при изменении текста
     
-    await session.commit()
+    await session.flush()
     return {"status": "success", "message_id": message_id}
 ```
 
 ---
 
 ### Алгоритм 3.4: Сквош-Слияние веток (`squash_merge_branch`)
-**Назначение:** Семантическая компрессия побочной ветки силами вспомогательной LLM (Gemini 2.0 Flash) с добавлением синтетического узла `SYSTEM_MERGE` в целевую ветку.
+**Назначение:** Семантическая компрессия побочной ветки силами вспомогательной LLM (Gemini) с добавлением синтетического узла `SYSTEM_MERGE` в целевую ветку.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client as API Client
     participant Engine as graph.py
-    participant LLM as Gemini 2.0 Flash
+    participant LLM as Gemini
     participant DB as SQLite Transaction
 
     Client->>Engine: squash_merge_branch(chat_id, source, target)
@@ -452,7 +409,7 @@ sequenceDiagram
    * **Валидация:** Если `len(active_delta) == 0`, слияние прерывается с ошибкой `400 Bad Request: "Нет новых активных сообщений с момента последнего слияния"`.
 4. **Контекстный мост (Prompt Bridge):** 
    * Если ветка уже сливалась ранее, извлекается текст предыдущего узла слияния (`previous_summary`).
-   * В Gemini 2.0 Flash передается промпт:
+   * В Gemini передается промпт:
      ```text
      Роль: Аналитический суммаризатор дерева решений.
      Задача: Сожми новую дельту обсуждения в структурированный узел слияния.
@@ -461,7 +418,8 @@ sequenceDiagram
      Выдели: Что изменилось/развилось с момента прошлого слияния, ключевые аргументы, финальный консенсус.
      Формат: Не более 200 слов. Высокая плотность фактов.
      ```
-5. **Транзакционная запись в БД (`async with session.begin()`):**
+5. **Запись в транзакции вызывающего кода:**
+   * После суммаризации атомарно проверяются вершины и точки последнего слияния обеих веток. При несовпадении выбрасывается `BranchConflictError`.
    * Создается `Message(role=SYSTEM_MERGE, parent_id=target.head_message_id, content=summary, chat_id=chat_id)`.
    * Создается `MergeEvent(message_id=new_msg.id, source_branch_name=source.name, forked_from_msg_id=start_node, compressed_messages_count=len(active_delta))`.
    * Сдвигается указатель целевой ветки: `target.head_message_id = new_msg.id`.
@@ -488,7 +446,7 @@ async def toggle_message_active(message_id: str, session: AsyncSession) -> bool:
     msg.is_active = not msg.is_active
     
     # updated_at намеренно НЕ изменяется (контент инвариантен)
-    await session.commit()
+    await session.flush()
     return msg.is_active
 ```
 
@@ -505,7 +463,7 @@ async def toggle_message_active(message_id: str, session: AsyncSession) -> bool:
 Взаимодействие с языковой моделью осуществляется через официальную библиотеку `google-genai`.
 
 #### 4.1.1. Базовая конфигурация модели
-* **Модель по умолчанию:** `gemini-2.0-flash` (высокая скорость генерации, нативная поддержка Function Calling).
+* **Модель:** задаётся через `GEMINI_MODEL`. По умолчанию используется `gemini-3.5-flash-lite` для генерации и суммаризации. Явный аргумент `model_name` переопределяет настройку.
 * **Системные инструкции (`system_instruction`):** Задаются глобально на уровне клиента, фиксируя аналитический стиль, запрет на нерелевантную вежливость и правила обращения к инструментам.
 * **Параметры сэмплирования:** `temperature = 0.7`, `top_p = 0.95`.
 
@@ -526,7 +484,7 @@ async def toggle_message_active(message_id: str, session: AsyncSession) -> bool:
 
 ```mermaid
 flowchart LR
-    LLM["Gemini 2.0 Flash"]
+    LLM["Gemini"]
     T1["search_history_fts\n(Полнотекстовый поиск FTS5)"]
     T2["get_branch_summary\n(Чтение саммари ветки)"]
     DB[("SQLite Database")]
@@ -609,8 +567,8 @@ sequenceDiagram
     participant DB as SQLite
 
     Client->>Orch: run_turn(chat_id, branch_name, prompt)
-    Orch->>DB: 1. INSERT Message (role=USER)
-    Orch->>DB: 2. reconstruct_context(chat_id, branch_name)
+    Orch->>DB: 1. INSERT Message (role=USER) и COMMIT
+    Orch->>DB: 2. read_context_from_head(head_id, session)
     DB-->>Orch: Возврат активной цепочки сообщений
 
     Note over Orch,Gemini: Эфимерный цикл в RAM (до 3 итераций)
@@ -628,8 +586,8 @@ sequenceDiagram
         end
     end
 
-    Orch->>DB: 3. INSERT Message (role=MODEL, metadata=execution_trace)
-    Orch->>DB: 4. UPDATE branch head_message_id
+    Orch->>DB: 3. Проверить ожидаемую вершину ветки
+    Orch->>DB: 4. INSERT Message (role=MODEL) и обновить вершину
     DB-->>Orch: Commit OK
     Orch-->>Client: Response (final_text, execution_trace)
 ```
@@ -638,7 +596,7 @@ sequenceDiagram
 1.**Эфимерность промежуточных шагов:** Все технические вызовы функций (`FunctionCall` и `FunctionResponse`) происходят строго в оперативной памяти (RAM). База данных SQLite **не создает** промежуточных узлов в таблице `messages`, что исключает разрыв и замусоривание графа DAG.
 2.**Лимит шагов (`max_iterations = 3`):** Если агент за 3 шага не вернул текстовый ответ, цикл принудительно обрывается. Выполняется финальный аварийный вызов Gemini без инструментов с требованием сформулировать ответ на основе уже извлеченных данных.
 3.**Детектор зацикливания (Loop Prevention):** Оркестратор хранит сигнатуры вызовов внутри текущей сессии: `(tool_name, hash(args))`. При попытке повторного вызова инструмента с идентичными параметрами выполнение блокируется, а модели возвращается системное уведомление об ошибке.
-4.**Атомарность сохранения:** Запись финального ответа модели `Message(role=MODEL)` в БД производится **только после полного завершения** генерации. Сетевой сбой во время работы инструментов оставляет граф в исходном валидном состоянии.
+4.**Границы транзакций:** CRUD выполняет `flush()`, а вызывающий код завершает транзакцию. `run_turn()` принимает выделенную сессию без открытой транзакции и фиксирует вопрос до обращения в Gemini. Ответ фиксируется отдельно после проверки ожидаемой вершины. Сетевой сбой или конфликт оставляет уже сохранённый вопрос доступным для повторной попытки.
 
 ---
 

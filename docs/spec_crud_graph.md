@@ -1,203 +1,120 @@
-# Спецификация графового ядра: `src/storage/crud/graph.py`
+# Спецификация графового ядра
 
-**Документ:** Архитектурная документация слоя манипуляции направленным ациклическим графом (DAG)  
-**Модуль:** `src.storage.crud/graph`  
-**Назначение:** Реализация базовых и графовых CRUD-операций, алгоритмов обхода дерева контекста, версионирования веток и инкрементального слияния.  
-**Стек:** Python 3.11+, SQLAlchemy 2.0 Async, aiosqlite.
+Модуль [`src.storage.crud.graph`](../src/storage/crud/graph.py) читает историю диалога, создаёт ветки, редактирует и маскирует реплики, выполняет инкрементальное сквош-слияние. Добавление обычной реплики и обновление вершины ветки реализованы в [`src.storage.crud.chats`](../src/storage/crud/chats.py).
 
----
+Требования MVP описаны в [`SPEC.md`](SPEC.md#3-спецификация-ключевых-алгоритмов-core-engine-logic), схема данных — в [документации хранилища](db_arcitecture.md). Ниже описано поведение текущего кода. Согласованные изменения перечислены отдельно в конце.
 
-## 1. Архитектурное назначение и границы модуля
+## 1. Транзакции и границы модуля
 
-Модуль `crud/graph.py` является изолированным вычислительным ядром слоя хранения (`Storage Layer`). 
-Он инкапсулирует всю бизнес-логику работы с реляционным представлением графа диалога, исключая утечку низкоуровневых SQL-запросов в сервисный слой API и слой ИИ-оркестратора.
+- Функции записи работают с переданной `AsyncSession` и выполняют `flush()`. Вызывающий код фиксирует изменения через `commit()` или откатывает транзакцию при ошибке. Для операции с собственной транзакцией можно использовать `async with session.begin()` на сессии без открытой транзакции.
+- Графовое ядро вызывает переданный асинхронный `summarizer_func` и ожидает текст выжимки. Конкретная реализация суммаризации выбирается вызывающим кодом.
+- При добавлении реплики или слиянии условный `UPDATE` сверяет вершину и указатель последнего слияния с прочитанными значениями. Если проверка проходит, SQLite удерживает право записи до завершения транзакции. При расхождении функция выбрасывает `BranchConflictError`, а вызывающий код откатывает операцию.
+- Оркестратор `run_turn()` использует выделенную сессию. Он отдельно фиксирует вопрос перед вызовом Gemini и сохраняет ответ только при совпадении ожидаемой вершины. См. [документацию агента](agent_core.md).
 
-### Базовые принципы реализации:
-1. **Транзакционная атомарность:** Все мутирующие операции выполняются в рамках единой асинхронной транзакции базы данных с автоматическим откатом (`rollback`) при возникновении исключений.
-2. **Отсутствие внешних сетевых зависимостей:** Модуль оперирует исключительно локальной базой данных SQLite и абстракцией сессии `AsyncSession`. Интеграция с внешними LLM-моделями инвертирована через внедрение зависимостей (Dependency Injection: передача вызываемого объекта `summarizer_func`).
-3. **Строгая типизация:** Полное покрытие сигнатур функций аннотациями типов Python (`typing`) и проверка валидности внешних идентификаторов (UUID).
+## 2. Доменные ошибки
 
----
+Все ошибки в таблице наследуются от `GraphEngineError`. Преобразование в HTTP-ответы относится к транспортному слою.
 
-## 2. Иерархия доменных исключений
+| Ошибка | Когда возникает |
+| --- | --- |
+| `BranchNotFoundError` | Запрошенная ветка отсутствует в указанном чате. При слиянии проверяются обе ветки. |
+| `BranchAlreadyExistsError` | Предварительная проверка при ветвлении обнаружила, что имя уже занято в чате. При конкурентной вставке ошибка ограничения уникальности пока может выйти как `IntegrityError`. |
+| `BranchConflictError` | Состояние ветки изменилось между чтением и записью. |
+| `MessageNotFoundError` | Сообщение отсутствует. При ветвлении эта же ошибка возвращается, если узел принадлежит другому чату. |
+| `NoActiveMessagesToMergeError` | Дельта пуста или все её реплики маскированы. |
 
-Для детерминированной обработки ошибок на уровне транспортного слоя FastAPI в модуле реализована специализированная иерархия исключений:
+При правке без подтверждения функция возвращает статус `warning_required`. Отсутствие сессии при правке или слиянии, а также отсутствие суммаризатора при слиянии приводит к `ValueError`.
 
-```mermaid
-classDiagram
-    class Exception
-    class GraphEngineError {
-        <<Base Exception>>
-    }
-    class BranchNotFoundError {
-        +branch_name: str
-    }
-    class BranchAlreadyExistsError {
-        +branch_name: str
-    }
-    class MessageNotFoundError {
-        +message_id: str
-    }
-    class NoActiveMessagesToMergeError
-
-    Exception <|-- GraphEngineError
-    GraphEngineError <|-- BranchNotFoundError
-    GraphEngineError <|-- BranchAlreadyExistsError
-    GraphEngineError <|-- MessageNotFoundError
-    GraphEngineError <|-- NoActiveMessagesToMergeError
-```
-
-* **`GraphEngineError`**: Корневое исключение подсистемы графа.
-* **`BranchNotFoundError`**: Выбрасывается при попытке обращения к несуществующей ветке в рамках `chat_id` (транслируется в HTTP `404 Not Found`).
-* **`BranchAlreadyExistsError`**: Защита от коллизий уникального индекса `(chat_id, name)` (транслируется в HTTP `409 Conflict`).
-* **`MessageNotFoundError`**: Выбрасывается при указании невалидного `target_message_id` или `message_id` (транслируется в HTTP `404 Not Found`).
-* **`NoActiveMessagesToMergeError`**: Предохранитель от пустого слияния, если все реплики дельты маскированы или отсутствуют (транслируется в HTTP `400 Bad Request`).
-
----
-
-## 3. Детальная спецификация алгоритмов ядра
+## 3. Алгоритмы ядра
 
 ### 3.1. Реконструкция линейного контекста (`reconstruct_context`)
-Функция выполняет рекурсивный трейсбек от актуальной вершины ветки к историческому корню с фильтрацией маскированных узлов и санитизацией смежных ролей.
+
+Функция принимает `chat_id`, `branch_name` и `session`. Она находит ветку и передаёт её вершину в `read_context_from_head()`. Результат — `list[Message]` с исходными активными узлами в порядке от корня к вершине.
 
 ```mermaid
 flowchart TD
-    Start(["Старт: reconstruct_context(chat_id, branch_name)"]) --> FetchBranch["Поиск ветки по (chat_id, branch_name)"]
-    FetchBranch --> CheckBranch{"Ветка найдена?"}
-    CheckBranch -- Нет --> ErrBranch["raise BranchNotFoundError"]
-    CheckBranch -- Да --> InitPointer["curr_id = branch.head_message_id\nactive_messages = []"]
-
-    InitPointer --> LoopCheck{"curr_id is not None?"}
-    LoopCheck -- Да --> FetchMsg["msg = session.get(Message, curr_id)"]
-    FetchMsg --> CheckActive{"msg.is_active == True?"}
-    CheckActive -- Да --> AppendMsg["active_messages.append(msg)"]
-    CheckActive -- Нет --> NextStep["Пропуск узла (маскирован)"]
-    AppendMsg --> NextStep
-    NextStep --> StepParent["curr_id = msg.parent_id"]
-    StepParent --> LoopCheck
-
-    LoopCheck -- Нет --> ReverseList["timeline = reversed(active_messages)"]
-    ReverseList --> Sanitize["Санитизация: склеивание смежных MODEL -> MODEL"]
-    Sanitize --> ReturnList(["Возврат sanitized_timeline"])
+    Start["Прочитать вершину ветки"] --> Fetch["Загрузить узел по ID"]
+    Fetch --> Found{"Узел найден?"}
+    Found -- Нет --> Reverse["Развернуть список активных узлов"]
+    Found -- Да --> Active{"is_active?"}
+    Active -- Да --> Add["Добавить узел в список"]
+    Active -- Нет --> Parent["Перейти к parent_id"]
+    Add --> Parent
+    Parent --> HasParent{"Есть родитель?"}
+    HasParent -- Да --> Fetch
+    HasParent -- Нет --> Reverse
 ```
 
-* **Вход:** `chat_id: str`, `branch_name: str`, `session: AsyncSession`.
-* **Выход:** `list[Message]` — хронологический массив сущностей `[Root -> ... -> Head]`.
-* **Инвариант санитизации:** Если вследствие установки флагов `is_active = False` на репликах пользователя в результирующей выборке два сообщения модели оказываются смежными, их контент объединяется в первый узел через двойной перенос строки `\n\n`. Это предотвращает отказ внешнего API Gemini (`400 Invalid Argument: model turns must alternate`).
+Маскированный узел пропускается при сборке списка. Обход продолжается через его `parent_id`. Смежные сообщения модели объединяются в адаптере Gemini при построении `Content`. Исходные объекты `Message` сохраняют свой текст и идентификаторы. Поиск исключает идентификаторы всех активных узлов до группировки.
 
----
+### 3.2. Ветвление (`branch_from_here`)
 
-### 3.2. Атомарное ветвление (`branch_from_here`)
-Создает новый независимый именованный указатель ветки, ссылающийся на произвольный узел в существующем графе диалога.
+Функция принимает `chat_id`, `target_message_id`, `new_branch_name` и `session`. Она проверяет принадлежность сообщения чату и доступность имени, затем добавляет `Branch` со статусом `ACTIVE` и возвращает объект после `flush()`. История до точки ветвления общая. Следующая реплика сдвинет вершину только той ветки, в которую её добавили.
 
 ```mermaid
 flowchart LR
-    TargetNode[("Узел target_message_id")]
-    
-    subgraph NewBranch ["Новая ветка: Branch"]
-        head["head_message_id"]
-        fork["forked_from_id"]
-    end
-
-    head -->|Указывает| TargetNode
-    fork -->|Фиксирует развилку| TargetNode
+    Head["head_message_id новой ветки"] --> Target["Существующий узел"]
+    Fork["forked_from_id новой ветки"] --> Target
 ```
 
-* **Вход:** `chat_id: str`, `target_message_id: str`, `new_branch_name: str`, `session: AsyncSession`.
-* **Выход:** Экземпляр созданной сущности `Branch`.
-* **Логика:**
-  1. Проверяет существование узла `target_message_id` строго внутри пространства `chat_id`.
-  2. Проверяет уникальность имени ветки через предикат `WHERE chat_id = :chat_id AND name = :new_branch_name`.
-  3. Создает объект `Branch` с полями `head_message_id = target_message_id` и `forked_from_id = target_message_id`, фиксируя точку бифуркации.
+### 3.3. Редактирование реплики (`update_message_content`)
 
----
+Функция принимает `message_id`, `new_content`, `force=False` и рабочую сессию. Сейчас проверка считает прямых потомков сообщения.
 
-### 3.3. In-Place редактирование контента (`update_message_content`)
-Обеспечивает мутацию содержимого реплики с защитой от непреднамеренной десинхронизации истории в разветвленных узлах графа.
-
-* **Вход:** `message_id: str`, `new_content: str`, `force: bool = False`, `session: AsyncSession`.
-* **Выход:** Словарь статуса операции (`{"status": "success" | "warning_required", ...}`).
-* **Алгоритм защиты предков (Ancestor Protection):**
-  * Вычисляется количество прямых дочерних реплик узла: `SELECT COUNT(id) FROM messages WHERE parent_id = :message_id`.
-  * Если `children_count > 1` и флаг `force == False`, мутация блокируется, и возвращается статус `warning_required` с указанием степени разветвления.
-  * При `force == True` (или `children_count <= 1`) выполняется обновление поля `content`, выставляется флаг `is_edited = True`, а метка `updated_at` принимает значение `datetime.now(timezone.utc)`.
-
----
+- Если потомков больше одного и `force=False`, возвращаются `status="warning_required"`, `children_count` и текст предупреждения. Запись не меняется.
+- Иначе функция записывает текст, устанавливает `is_edited=True` и обновляет `updated_at`. Результат содержит `status="success"` и `message_id`.
 
 ### 3.4. Контекстное маскирование (`toggle_message_active`)
-Инвертирует видимость реплики для алгоритма реконструкции контекста без нарушения ссылочной целостности графа связей `parent_id`.
 
-* **Вход:** `message_id: str`, `session: AsyncSession`.
-* **Выход:** Новое булево состояние флага `is_active`.
-* **Инвариант контента:** Операция **не мутирует** поле `updated_at`, так как текстовое тело сообщения (`content`) остается неизменным.
-
----
+Функция принимает `message_id` и `session`, инвертирует `is_active` и возвращает новое значение. Текст реплики, время правки и связи графа сохраняются.
 
 ### 3.5. Инкрементальное сквош-слияние (`squash_merge_branch`)
-Реализует семантическую компрессию побочной линии рассуждений и ее интеграцию в целевую ветку в виде полиморфного узла `MergeEvent` (роль `SYSTEM_MERGE`).
+
+Функция принимает `chat_id`, `source_branch_name`, `target_branch_name="main"`, асинхронный `summarizer_func` и рабочую сессию. Она читает обе вершины и их указатели последнего слияния. Начало дельты — `source.last_merged_message_id`, а для первого слияния — `source.forked_from_id`. Обход идёт от исходной вершины до этой границы, исключая сам граничный узел.
+
+После фильтрации по `is_active` суммаризатор получает активные реплики от старых к новым. При пустой дельте он не вызывается. После суммаризации ядро проверяет, что обе ветки сохранили прочитанное состояние, добавляет `MergeEvent` с ролью `SYSTEM_MERGE`, сдвигает целевую вершину на новый узел и записывает исходную вершину в `source.last_merged_message_id`. Статус исходной ветки сохраняется.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant Caller as Сервисный слой / API
-    participant Graph as crud/graph.py
-    participant Summarizer as Внешний суммаризатор (Callable)
-    participant DB as SQLite Transaction
+    participant Caller as Вызывающий код
+    participant Graph as graph.py
+    participant Summarizer as Суммаризатор
+    participant DB as SQLite
 
-    Caller->>Graph: squash_merge_branch(chat_id, source, target, summarizer)
-    Graph->>DB: Выборка source_branch и target_branch
-    
-    Note over Graph: Определение точки отсчета дельты:<br/>start_node = last_merged_message_id ?? forked_from_id
-    
-    Graph->>DB: Сбор цепочки узлов от source.head до start_node
-    DB-->>Graph: Список сообщений дельты
-    
-    Note over Graph: Фильтрация: active_delta = [m for m in delta if m.is_active]
-    
-    Graph->>Summarizer: summarizer_func(active_delta_ordered)
-    Summarizer-->>Graph: Текст семантического сжатия (summary_text)
-
-    rect rgb(20, 30, 40)
-    Note over Graph,DB: Атомарная фиксация транзакции
-    Graph->>DB: INSERT MergeEvent (role=SYSTEM_MERGE, parent_id=target.head)
-    Graph->>DB: UPDATE target.head_message_id = MergeEvent.id
-    Graph->>DB: UPDATE source.last_merged_message_id = source.head_message_id
-    Graph->>DB: COMMIT
+    Caller->>Graph: squash_merge_branch(..., session)
+    Graph->>DB: Прочитать обе ветки и собрать дельту
+    Graph->>Summarizer: Передать активные реплики в порядке истории
+    Summarizer-->>Graph: Вернуть выжимку
+    Graph->>DB: Условно проверить состояние обеих веток
+    alt Состояние изменилось
+        Graph-->>Caller: BranchConflictError
+        Caller->>DB: Откатить транзакцию
+    else Состояние совпало
+        Graph->>DB: Записать MergeEvent и обновить указатели
+        Graph-->>Caller: Вернуть данные слияния после flush
+        Caller->>DB: Зафиксировать транзакцию
     end
-
-    Graph-->>Caller: Dict (status, merge_message_id, summary)
 ```
 
-* **Определение границы дельты:**
-  $$\text{start\_node} = \begin{cases} \text{source.last\_merged\_message\_id}, & \text{если существует} \\ \text{source.forked\_from\_id}, & \text{иначе} \end{cases}$$
-* **Защита от пустых слияний:** Если после фильтрации `is_active == True` дельта пуста, выбрасывается `NoActiveMessagesToMergeError`.
-* **Поддержка непрерывности:** Побочная ветка сохраняет статус `ACTIVE`, а указатель `last_merged_message_id` сдвигается на текущий `head_message_id`, позволяя производить последующие инкрементальные слияния.
+Результат содержит `status`, `merge_message_id`, `source_branch`, `target_branch`, `compressed_messages_count` и `summary`. Если старую реплику включить после того, как указатель слияния прошёл её, она снова появится в контексте исходной ветки. В будущую дельту она не войдёт.
 
----
+## 4. Стоимость операций
 
-## 4. Временная сложность и метрики производительности
+| Операция | От чего зависит объём работы |
+| --- | --- |
+| Сборка контекста | От числа узлов от вершины до корня. Обход загружает сообщения по первичному ключу. |
+| Ветвление | Поиск исходного узла и имени ветки, затем вставка одного указателя. |
+| Редактирование | Поиск сообщения и подсчёт его прямых потомков с использованием индекса по `parent_id`. |
+| Маскирование | Чтение и обновление одного сообщения. |
+| Сквош-слияние | От длины пройденной дельты и времени суммаризации. Запись включает проверку состояния веток, вставку узла слияния и обновление указателей. |
 
-| Алгоритм | Временная сложность | Дисковые операции (I/O) | Индексы БД |
-| :--- | :--- | :--- | :--- |
-| `reconstruct_context` | $O(K)$, где $K$ — глубина ветки | $K$ точечных чтений по PK | `PRIMARY KEY (id)`, `idx_messages_parent_id` |
-| `branch_from_here` | $O(1)$ | 1 чтение, 1 запись | `uq_chat_branch_name`, `PRIMARY KEY (id)` |
-| `update_message_content`| $O(1)$ | 1 чтение, 1 агрегация, 1 запись | `idx_messages_parent_id` |
-| `toggle_message_active` | $O(1)$ | 1 чтение, 1 запись | `PRIMARY KEY (id)` |
-| `squash_merge_branch` | $O(\Delta) + O(\text{LLM})$, где $\Delta$ — длина дельты | $\Delta$ чтений, 2 записи | `PRIMARY KEY (id)`, `idx_messages_parent_id` |
+## 5. Проверки
 
-*Все операции чтения выполняются в пределах $0.5–2.0$ мс на локальной базе данных SQLite в режиме WAL.*
+- [Тесты графа](../tests/test_graph.py) проверяют порядок и идентичность активных узлов, сохранность исходного текста после фиксации, ветвление, правку, маскирование и повторное слияние.
+- [Тесты оркестратора](../tests/test_loop.py) проверяют сохранность вопроса через новую сессию, повторный запуск после сбоя и конфликт записи при изменении исходной или целевой ветки. Проверки конфликта используют файловую SQLite и независимые сессии.
 
----
+## 6. Согласованные изменения MVP
 
-## 5. Инварианты тестирования (TDD Verification)
-
-Корректность алгоритмов ядра математически зафиксирована набором модульных тестов в `tests/test_graph.py` (9/9 passed):
-1. **`test_reconstruct_context_linear_order`**: Гарантия хронологической сборки цепочки реплик.
-2. **`test_reconstruct_context_role_sanitization`**: Корректность объединения смежных ходов модели.
-3. **`test_branch_from_here_success`**: Проверка инициализации указателей ветки.
-4. **`test_branch_from_here_duplicate_name_error`**: Срабатывание уникального ограничения на уровне чата.
-5. **`test_update_message_content_ancestor_warning`**: Блокировка неявной мутации общего предка.
-6. **`test_update_message_content_force_success`**: Принудительная мутация с фиксацией `updated_at`.
-7. **`test_toggle_message_active_invariants`**: Инвариант неизменности времени правки при тумблировании.
-8. **`test_squash_merge_branch_incremental`**: Создание полиморфной записи `MergeEvent` и смещение `last_merged_message_id`.
-9. **`test_squash_merge_empty_delta_fails`**: Валидация наличия активных сообщений при сжатии.
+- Слияние разрешается строго в `main`. Слияние ветки в себя отклоняется. Сейчас `target_branch_name` остаётся произвольным и отдельная проверка совпадения веток отсутствует.
+- Пустая выжимка должна отклоняться до записи. Сейчас проверяется наличие активных реплик в дельте, а возвращённый текст сохраняется без отдельной проверки.
+- Для подтверждения правки нужно учитывать ветки, из вершин которых достижима реплика. Текущая проверка по числу прямых потомков пропускает случай, когда одна из веток указывает на реплику напрямую.

@@ -1,0 +1,182 @@
+# Спецификация ИИ-подсистемы и оркестратора: `src/agent/`
+
+**Документ:** Архитектурная документация слоя ИИ-оркестрации, адаптера LLM и инструментов памяти  
+**Модули:** `src.agent.prompts`, `src.agent.client`, `src.agent.tools`, `src.agent.loop`, `src.storage.fts`  
+**Назначение:** Реализация управляемого цикла рассуждений (ReAct), безопасного вызова инструментов (Tool Use), адаптации протокола Google Gemini API и сквозной наблюдаемости.  
+**Стек:** Python 3.11+, `google-genai` SDK, SQLAlchemy 2.0 Async, SQLite FTS5.
+
+---
+
+## 1. Архитектура подсистемы и границы слоев
+
+Подсистема агента спроектирована по принципам **Clean Architecture** и **Dependency Inversion**. Слой оркестрации полностью изолирован от низкоуровневых деталей хранения данных (SQL/SQLite) и от внутренних структур данных внешнего провайдера (`google.genai.types`).
+
+```mermaid
+flowchart TD
+    subgraph AgentLayer ["Слой ИИ-Агента (src/agent/)"]
+        Loop["loop.py\n(Исполнительный ReAct-цикл)"]
+        Prompts["prompts.py\n(Системные директивы)"]
+        Client["client.py\n(Anti-Corruption Layer / SDK)"]
+        Tools["tools.py\n(Тонкий фасад инструментов)"]
+    end
+
+    subgraph StorageLayer ["Слой хранения (src/storage/)"]
+        FTS["fts.py\n(FTSQueryBuilder + SQL FTS5)"]
+        Chats["crud/chats.py\n(get_branch, append_message)"]
+        Graph["crud/graph.py\n(reconstruct_context)"]
+    end
+
+    Loop -->|Читает инструкции| Prompts
+    Loop -->|Вызывает через нейтральный API| Client
+    Loop -->|Оборачивает в замыкания| Tools
+    Loop -->|Запись реплик и сборка контекста| Chats
+    Loop -->|Сборка истории ветки| Graph
+
+    Tools -->|Делегирует поиск| FTS
+    Tools -->|Делегирует чтение MergeEvent| Chats
+```
+
+### Инварианты разделения ответственности:
+1. **`loop.py`** не импортирует `sqlalchemy.select`, `sqlalchemy.text` и не содержит ни одной строчки SQL. Также модуль не зависит от `google.genai.types`.
+2. **`tools.py`** выступает фасадом: принимает аргументы, вызывает функции слоя `src/storage/`, усекает сниппеты и форматирует строку для нейросети.
+3. **`prompts.py`** изолирует все текстовые инструкции и шаблоны промптов от программной логики.
+
+---
+
+## 2. Адаптер Gemini API и трансформация протокола (`client.py`)
+
+Модуль `src/agent/client.py` реализует паттерн **Anti-Corruption Layer**, переводя доменные модели графа в формат протокола Google Gemini. Модель задаётся через `GEMINI_MODEL`.
+
+### 2.1. Отключение автоматического вызова функций (AFC)
+По умолчанию в библиотеке `google-genai` при передаче Python-функций в параметр `tools` активируется скрытый режим Automatic Function Calling (AFC), в котором SDK самостоятельно выполняет функции внутри себя.
+
+Для сохранения полного контроля над лимитом итераций, работой `Loop Guard` и формированием трассировки `execution_trace`, автовызов в методе `GeminiClient.generate_step` **принудительно отключен**:
+```python
+automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+```
+
+### 2.2. Правила маппинга ролей (`map_messages_to_gemini`)
+Поскольку API Gemini требует строгого соответствия ролям `user` / `model` в массиве истории `contents`, адаптер применяет следующие правила:
+
+| Доменная роль (`MessageRole`) | Целевая роль API | Трансформация текста и группировка |
+| :--- | :--- | :--- |
+| `USER` | `user` | Передается без изменений. |
+| `MODEL` | `model` | Передается без изменений. |
+| `SYSTEM_MERGE` | `user` | Оборачивается префиксом:<br/>`[СИСТЕМНЫЙ УЗЕЛ: Слияние ветки '<name>']\n<content>` |
+
+**Коалесценция смежных ходов:** Если в базе подряд идут несколько сообщений от пользователя (или за `USER` следует `SYSTEM_MERGE`), маппер автоматически объединяет их текстовые блоки `Part` внутрь **единого** объекта `types.Content(role="user", parts=[...])`. Это обеспечивает поддержку цепочечной отправки реплик без нарушения чередования ролей на стороне Google API.
+
+---
+
+## 3. Инструменты памяти и полнотекстовый поиск (`tools.py`, `fts.py`)
+
+### 3.1. Динамические замыкания (Tool Closures)
+Инструменты базы данных в `src/agent/tools.py` принимают служебные зависимости (`chat_id`, `session: AsyncSession`, `exclude_message_ids`). Передача этих сигнатур в модель невозможна по двум причинам:
+1. Несериализуемость объекта `AsyncSession` в JSON Schema.
+2. Нарушение изоляции (модель не должна иметь возможности подменять `chat_id`).
+
+Внутри `run_turn` в `loop.py` динамически создаются безопасные замыкания (Closures), захватывающие текущую сессию, `chat_id` и список активных ID текущей ветки:
+* **`search_history(query: str, limit: int = 5)`** — модель видит только поисковый запрос и лимит.
+* **`get_summary(branch_name: str)`** — модель видит только имя ветки.
+
+### 3.2. Архитектурное решение: `FTSQueryBuilder` vs. `pymorphy3` (Explanation)
+Встроенный в SQLite токенизатор `unicode61` не выполняет морфологический анализ русского языка. Вместо внедрения тяжелых лемматизаторов (`pymorphy3` со словарем ~30 МБ) реализован легковесный инкапсулированный нормализатор `FTSQueryBuilder` (`src/storage/fts.py`).
+
+**Обоснование выбора:**
+* Внедрение внешнего лемматизатора потребовало бы удаления автоматических триггеров `AFTER INSERT / UPDATE` в SQLite (так как триггеры БД не могут вызывать Python-функции) и переноса синхронизации индекса в ручной код приложения.
+* `FTSQueryBuilder` сохраняет нативные триггеры SQLite, экранирует зарезервированные операторы FTS5 (`AND`, `OR`, `NOT`), отсекает регулярные падежные окончания (`_SUFFIXES`) и формирует префиксные термы `основа*`, покрывая 85–90% словоформ без накладных расходов и внешних зависимостей.
+* **Предохранители поиска:** Обязательное исключение ID сообщений текущей активной ветки (защита от «бага зеркала») и усечение найденных сниппетов до 800 символов (защита от переполнения контекста).
+
+---
+
+## 4. Исполнительный цикл ReAct и отказоустойчивость (`loop.py`)
+
+Функция `run_turn` управляет полным жизненным циклом ответа на запрос пользователя.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as API / Сервис
+    participant Loop as loop.py (run_turn)
+    participant Lock as asyncio.Lock
+    participant DB as Storage Layer
+    participant Client as GeminiClient
+    participant Tools as Bound Closures
+
+    Caller->>Loop: run_turn(chat_id, branch_name, user_prompt)
+    Loop->>DB: get_branch(chat_id, branch_name)
+    Loop->>Lock: Проверка блокировки ветки
+    alt Ветка уже генерирует ответ
+        Lock-->>Caller: raise BranchBusyError (409 Conflict)
+    end
+
+    opt user_prompt передан (Вариант Б)
+        Loop->>DB: append_message(USER, user_prompt)
+    end
+    Loop->>DB: read_context_from_head(head_id, session)
+    DB-->>Loop: Хронология активной ветки
+    Loop->>Client: map_messages_to_gemini(timeline)
+
+    rect rgb(20, 35, 30)
+    Note over Loop,Tools: Эфимерный ReAct-цикл в RAM (max_iterations = 3)
+    loop Пока i < 3 и есть function_calls
+        Loop->>Client: generate_step(contents, tools)
+        alt Модель запросила инструменты
+            Client-->>Loop: function_calls
+            Loop->>Loop: Loop Guard (проверка дубликата сигнатуры)
+            Loop->>Tools: Вызов функции в try/except
+            Tools-->>Loop: Результат (или текст ошибки)
+            Loop->>Loop: Запись метрик в execution_steps
+            Loop->>Client: append_tool_interaction(contents, results)
+        else Модель выдала финальный текст
+            Client-->>Loop: final_text
+        end
+    end
+    end
+
+    opt Превышен лимит 3 итераций (Graceful Fallback)
+        Loop->>Client: append_user_text(FALLBACK_MAX_ITERATIONS_PROMPT)
+        Loop->>Client: generate_step(contents, tools=None)
+    end
+
+    Loop->>DB: append_message(MODEL, final_text, metadata_json=trace)
+    Loop-->>Caller: Message (MODEL)
+```
+
+### Инварианты надежности и обработки сбоев:
+1. **Политика сохранности мыслей (Вариант Б):** Сообщение пользователя записывается в БД *до* сетевого вызова Gemini. Если произойдет сбой API Google (квоты `429`, таймаут `502`), вопрос пользователя не теряется, и повторный запуск `run_turn(..., user_prompt=None)` догенерирует ответ на уже существующую цепочку сообщений.
+2. **Защита от гонки запросов (`BranchBusyError`):** На каждую ветку заводится `asyncio.Lock`. Повторный параллельный вызов на ту же ветку до завершения генерации немедленно отклоняется.
+3. **Детектор зацикливания (Loop Guard):** Сигнатура `(tool_name, sorted_json_args)` кэшируется внутри хода. Повторный вызов с теми же аргументами перехватывается без обращения к БД с возвратом уведомления модели.
+4. **Изоляция ошибок тулов:** Исключения внутри Python-инструментов не прерывают генерацию — текст ошибки передается модели для самостоятельной корректировки рассуждений.
+5. **Защита от пустой записи (`LLMGenerationError`):** При пустом ответе модели или блокировке фильтрами безопасности узел `MODEL` в БД не создается.
+
+---
+
+## 5. Наблюдаемость (Observability) и Тестирование
+
+### 5.1. Схема трассировки (`metadata_json`)
+Промежуточные вызовы тулов не засоряют граф `messages`. Весь ход рассуждений фиксируется в JSON-поле `metadata_json` итогового сообщения `ModelMessage`:
+
+```json
+{
+  "execution_trace": {
+    "iterations_used": 1,
+    "steps": [
+      {
+        "step": 1,
+        "tool_called": "search_history",
+        "arguments": {"query": "FastAPI"},
+        "output_summary": "[2026-11-10 14:20] user: Исторический факт...",
+        "execution_time_ms": 2.41
+      }
+    ],
+    "total_duration_ms": 845.12
+  }
+}
+```
+
+### 5.2. Тесты подсистемы
+Сценарии подсистемы проверяются без сетевых запросов с помощью `pytest` и `AsyncMock`.
+* **`tests/test_tools.py`:** Проверка морфологии `FTSQueryBuilder`, экранирования спецсимволов FTS5, изоляции между чатами, триггеров синхронизации после `Edit`/`Toggle`, усечения сниппетов и инкрементальной выборки `get_branch_summary`.
+* **`tests/test_client.py`:** Проверка маппинга ролей, системного префикса `SYSTEM_MERGE`, склеивания смежных `user`-реплик, проброса конфигов и защиты от `None`-ответа SDK.
+* **`tests/test_loop.py`:** Проверка прямого ответа, реального сквозного поиска в ReAct-цикле, Loop Guard, принудительного Fallback на 3-й итерации, сохранения промпта при сбое API, режима `user_prompt=None`, защиты от пустых ответов, восстановления при галлюцинации имени тула и блокировки `BranchBusyError`.
