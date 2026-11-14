@@ -5,7 +5,11 @@ from typing import Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.storage.crud.graph import BranchNotFoundError
+from src.storage.crud.graph import (
+    BranchConflictError,
+    BranchNotFoundError,
+    reserve_branch_write,
+)
 from src.storage.models import (
     Branch,
     Chat,
@@ -36,13 +40,20 @@ async def append_message(
     content: str,
     session: AsyncSession,
     metadata_json: Optional[str] = None,
+    *,
+    expected_head_id: Optional[str] = None,
 ) -> Message:
-    """Добавляет реплику в конец ветки, сдвигает указатель HEAD и обновляет активность чата."""
+    """Добавляет реплику и обновляет ветку. Транзакцию завершает вызывающий код."""
     branch = await get_branch(chat_id=chat_id, branch_name=branch_name, session=session)
     if not branch:
         raise BranchNotFoundError(
             f"Ветка '{branch_name}' не найдена в чате {chat_id}"
         )
+
+    head_id = branch.head_message_id
+    if expected_head_id is not None and head_id != expected_head_id:
+        raise BranchConflictError("Состояние ветки изменилось. Повторите операцию.")
+    await reserve_branch_write(session, branch.id, head_id, branch.last_merged_message_id)
 
     msg_cls = ModelMessage if role == MessageRole.MODEL else Message
     now = datetime.now(timezone.utc)
@@ -50,7 +61,7 @@ async def append_message(
     new_msg = msg_cls(
         id=str(uuid.uuid4()),
         chat_id=chat_id,
-        parent_id=branch.head_message_id,
+        parent_id=head_id,
         role=role,
         content=content,
         is_active=True,
@@ -65,8 +76,7 @@ async def append_message(
         update(Chat).where(Chat.id == chat_id).values(updated_at=now)
     )
 
-    await session.commit()
-    await session.refresh(new_msg)
+    await session.flush()
     return new_msg
 
 

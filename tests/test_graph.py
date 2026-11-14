@@ -3,8 +3,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.agent.client import map_messages_to_gemini
+from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
     BranchAlreadyExistsError,
     BranchNotFoundError,
@@ -17,6 +19,7 @@ from src.storage.crud.graph import (
     update_message_content,
 )
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
+from tests.conftest import create_initial_chat
 
 
 @pytest.mark.asyncio
@@ -63,11 +66,10 @@ async def test_reconstruct_context_linear_order(
 
 
 @pytest.mark.asyncio
-async def test_reconstruct_context_role_sanitization(
+async def test_reconstruct_context_preserves_nodes_and_stored_text(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
 ) -> None:
-    """Проверка склеивания двух подряд идущих сообщений модели при санитизации (Алгоритм 3.1)."""
     chat_id = initial_chat_setup["chat_id"]
     root_id = initial_chat_setup["root_message_id"]
 
@@ -113,11 +115,38 @@ async def test_reconstruct_context_role_sanitization(
     await session.commit()
 
     timeline = await reconstruct_context(chat_id, "main", session)
+    contents = map_messages_to_gemini(timeline)
+    await session.commit()
 
-    assert len(timeline) == 2
-    assert timeline[0].id == root_id
-    assert timeline[1].role == MessageRole.MODEL
-    assert timeline[1].content == "Part 1\n\nPart 2"
+    stored_texts = (await session.scalars(
+        select(Message.content)
+        .where(Message.id.in_([msg2_id, msg4_id]))
+        .order_by(Message.content)
+    )).all()
+    assert stored_texts == ["Part 1", "Part 2"]
+    assert [message.id for message in timeline] == [root_id, msg2_id, msg4_id]
+    assert [content.role for content in contents] == ["user", "model"]
+    assert [part.text for part in contents[1].parts] == ["Part 1\n\nPart 2"]
+
+
+@pytest.mark.asyncio
+async def test_append_leaves_transaction_to_caller(
+    file_sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with file_sessions() as session:
+        setup = await create_initial_chat(session)
+        chat_id = setup["chat_id"]
+        chat = await session.get(Chat, chat_id)
+        assert chat is not None
+        chat.title = "Pending title"
+        message = await append_message(chat_id, "main", MessageRole.USER, "Pending text", session)
+        message_id = message.id
+        await session.rollback()
+
+    async with file_sessions() as session:
+        chat = await session.get(Chat, chat_id)
+        assert chat is not None and chat.title == "Test Chat"
+        assert await session.get(Message, message_id) is None
 
 
 @pytest.mark.asyncio

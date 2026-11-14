@@ -9,11 +9,12 @@ from src.agent.prompts import (
     SUMMARIZER_SYSTEM_INSTRUCTION,
     SUMMARIZER_USER_PROMPT_TEMPLATE,
 )
+from src.config import settings
 from src.storage.models import Message, MessageRole
 
 
 def map_messages_to_gemini(messages: list[Message]) -> list[types.Content]:
-    """Транслирует доменные узлы графа в массив Content с группировкой смежных реплик user."""
+    """Преобразует узлы графа в историю Gemini с группировкой смежных ролей."""
     contents: list[types.Content] = []
 
     for msg in messages:
@@ -34,12 +35,16 @@ def map_messages_to_gemini(messages: list[Message]) -> list[types.Content]:
             api_role = "user"
             text = msg.content
 
-        part = types.Part.from_text(text=text)
-
-        if contents and contents[-1].role == "user" and api_role == "user":
-            contents[-1].parts.append(part)
+        if contents and contents[-1].role == api_role:
+            parts = contents[-1].parts
+            if api_role == "model":
+                parts[0] = types.Part.from_text(text=f"{parts[0].text}\n\n{text}")
+            else:
+                parts.append(types.Part.from_text(text=text))
         else:
-            contents.append(types.Content(role=api_role, parts=[part]))
+            contents.append(
+                types.Content(role=api_role, parts=[types.Part.from_text(text=text)])
+            )
 
     return contents
 
@@ -50,9 +55,9 @@ class GeminiClient:
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-2.0-flash",
+        model_name: Optional[str] = None,
     ) -> None:
-        self._model_name = model_name
+        self._model_name = settings.GEMINI_MODEL if model_name is None else model_name
         self._client = genai.Client(api_key=api_key)
 
     async def generate_step(

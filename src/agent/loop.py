@@ -10,7 +10,7 @@ from src.agent.client import GeminiClient, map_messages_to_gemini
 from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
 from src.agent.tools import get_branch_summary, search_history_fts
 from src.storage.crud.chats import append_message, get_branch
-from src.storage.crud.graph import BranchNotFoundError, reconstruct_context
+from src.storage.crud.graph import BranchNotFoundError, read_context_from_head
 from src.storage.models import Message, MessageRole
 
 _branch_locks: dict[str, asyncio.Lock] = {}
@@ -36,7 +36,9 @@ async def run_turn(
     user_prompt: Optional[str] = None,
     max_iterations: int = 3,
 ) -> Message:
-    """Выполняет полный цикл обработки хода (сохранение вопроса, ReAct, трассировка, ответ)."""
+    """Выполняет ход в выделенной сессии и отдельно фиксирует вопрос и ответ."""
+    if session.in_transaction():
+        raise ValueError("Для генерации требуется выделенная сессия без открытой транзакции.")
     branch = await get_branch(chat_id=chat_id, branch_name=branch_name, session=session)
     if not branch:
         raise BranchNotFoundError(
@@ -50,20 +52,24 @@ async def run_turn(
         )
 
     async with lock:
+        head_id = branch.head_message_id
         if user_prompt is not None and user_prompt.strip():
-            await append_message(
-                chat_id=chat_id,
-                branch_name=branch_name,
-                role=MessageRole.USER,
-                content=user_prompt,
-                session=session,
-            )
+            try:
+                question = await append_message(
+                    chat_id=chat_id,
+                    branch_name=branch_name,
+                    role=MessageRole.USER,
+                    content=user_prompt,
+                    session=session,
+                    expected_head_id=head_id,
+                )
+                head_id = question.id
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
 
-        timeline = await reconstruct_context(
-            chat_id=chat_id,
-            branch_name=branch_name,
-            session=session,
-        )
+        timeline = await read_context_from_head(head_id, session)
         active_ids = [msg.id for msg in timeline]
         contents = map_messages_to_gemini(timeline)
 
@@ -186,11 +192,18 @@ async def run_turn(
             }
         }
 
-        return await append_message(
-            chat_id=chat_id,
-            branch_name=branch_name,
-            role=MessageRole.MODEL,
-            content=final_text,
-            metadata_json=json.dumps(trace_payload, ensure_ascii=False),
-            session=session,
-        )
+        try:
+            answer = await append_message(
+                chat_id=chat_id,
+                branch_name=branch_name,
+                role=MessageRole.MODEL,
+                content=final_text,
+                metadata_json=json.dumps(trace_payload, ensure_ascii=False),
+                session=session,
+                expected_head_id=head_id,
+            )
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+        return answer
