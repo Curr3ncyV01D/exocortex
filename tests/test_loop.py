@@ -10,8 +10,9 @@ from google.genai import types
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.agent.client import GeminiClient
-from src.agent.loop import BranchBusyError, LLMGenerationError, run_turn
+from src.agent.client import GeminiClient, map_messages_to_gemini
+from src.agent.loop import BranchBusyError, LLMGenerationError, PromptTooLargeError, run_turn
+from src.config import settings
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import BranchConflictError, branch_from_here, squash_merge_branch
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
@@ -74,15 +75,118 @@ async def test_turn_deadline_releases_lock_and_keeps_question(
 
 
 @pytest.mark.asyncio
-async def test_turn_budget_rejects_large_context(session, initial_chat_setup, monkeypatch):
-    monkeypatch.setattr("src.agent.loop.MAX_CONTEXT_BYTES", 1)
+async def test_turn_budget_rejects_oversized_latest_message(session, initial_chat_setup, monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", 1)
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
         client.generate_step = AsyncMock()
-        with pytest.raises(LLMGenerationError, match="Контекст"):
+        with pytest.raises(PromptTooLargeError, match="MAX_CONTEXT_BYTES"):
             await run_turn(initial_chat_setup["chat_id"], "main", client, session)
         client.generate_step.assert_not_awaited()
     assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_fts(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 200, session)
+    orphan = await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
+    hot_text = "Последний вопрос об ArchiveMarker"
+    latest = await append_message(chat_id, "main", MessageRole.USER, hot_text, session)
+    latest_id = latest.id
+    budget = _contents_size(map_messages_to_gemini([orphan, latest])) + 1500
+    # Make the older message larger than the remaining budget even before the orphan is removed.
+    await session.commit()
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
+    requests = []
+
+    async def generate(*, contents, tools):
+        requests.append([item.model_copy(deep=True) for item in contents])
+        if len(requests) == 1:
+            return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
+        return _make_text_response("Recovered")
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=generate)
+        answer = await run_turn(chat_id, "main", client, session)
+
+    assert answer.parent_id == latest_id
+    assert [item.role for item in requests[0]] == ["user"]
+    assert [part.text for part in requests[0][0].parts] == [hot_text]
+    tool_result = requests[1][-1].parts[0].function_response
+    assert "ArchiveMarker" in tool_result.response["result"]
+    assert hot_text not in tool_result.response["result"]
+    assert all(_contents_size(request) <= budget for request in requests)
+
+
+def _contents_size(contents: list[types.Content]) -> int:
+    return sum(len(item.model_dump_json().encode("utf-8")) for item in contents)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [True, False])
+async def test_run_turn_checks_client_head_before_writing_or_generating(
+    session: AsyncSession, initial_chat_setup: dict[str, str], matches: bool,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    head_id = initial_chat_setup["root_message_id"]
+    expected = head_id if matches else str(uuid.uuid4())
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(return_value=_make_text_response("Reply"))
+        if matches:
+            answer = await run_turn(chat_id, "main", client, session, expected_head_id=expected)
+            assert answer.parent_id == head_id
+            client.generate_step.assert_awaited_once()
+        else:
+            with pytest.raises(BranchConflictError):
+                await run_turn(
+                    chat_id, "main", client, session, user_prompt="Unwritten",
+                    expected_head_id=expected,
+                )
+            client.generate_step.assert_not_awaited()
+            ids = await session.scalars(select(Message.id).where(Message.chat_id == chat_id))
+            assert ids.all() == [head_id]
+
+
+@pytest.mark.asyncio
+async def test_prompt_exact_utf8_budget_and_tool_batch_overflow(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    prompt = "Кириллица 🧪"
+    only_prompt = map_messages_to_gemini([Message(role=MessageRole.USER, content=prompt)])
+    budget = _contents_size(only_prompt)
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget - 1)
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(PromptTooLargeError):
+            await run_turn(chat_id, "main", client, session, user_prompt=prompt)
+        client.generate_step.assert_not_awaited()
+        assert not session.in_transaction()
+
+        monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([("search_history", {"query": "Root"})]),
+            _make_text_response("Reply"),
+        ])
+        answer = await run_turn(
+            chat_id, "main", client, session, user_prompt=prompt,
+            expected_head_id=initial_chat_setup["root_message_id"],
+        )
+
+    question = await session.get(Message, answer.parent_id)
+    assert question is not None and question.content == prompt
+    assert question.parent_id == initial_chat_setup["root_message_id"]
+    assert client.generate_step.await_count == 2
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    for call in client.generate_step.await_args_list:
+        assert call.kwargs["contents"] == only_prompt
 
 
 @pytest.mark.asyncio
