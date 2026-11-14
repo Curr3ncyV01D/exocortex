@@ -96,9 +96,9 @@ class Branch(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(64), nullable=False)
-    head_message_id: Mapped[str] = mapped_column(
+    head_message_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        nullable=False,
+        nullable=True,
     )
     last_merged_message_id: Mapped[Optional[str]] = mapped_column(
         String(36),
@@ -120,7 +120,7 @@ class Branch(Base):
     )
 
     chat: Mapped["Chat"] = relationship("Chat", back_populates="branches")
-    head_message: Mapped["Message"] = relationship(
+    head_message: Mapped[Optional["Message"]] = relationship(
         "Message",
         foreign_keys=[head_message_id],
     )

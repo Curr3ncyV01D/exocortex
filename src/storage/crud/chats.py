@@ -1,38 +1,31 @@
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
-from sqlalchemy import literal_column, select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
     GraphIntegrityError,
+    get_branch as get_branch,
+    get_latest_merge_event as get_latest_merge_event,
     message_belongs_to_chat,
     reserve_branch_write,
 )
 from src.storage.models import (
-    Branch,
     Chat,
-    MergeEvent,
     Message,
     MessageRole,
     ModelMessage,
 )
 
 
-async def get_branch(
-    chat_id: str,
-    branch_name: str,
-    session: AsyncSession,
-) -> Optional[Branch]:
-    """Возвращает объект ветки по идентификатору чата и символьному имени."""
-    stmt = select(Branch).where(
-        Branch.chat_id == chat_id,
-        Branch.name == branch_name,
-    )
-    return (await session.execute(stmt)).scalar_one_or_none()
+class _ExpectedHead(Enum):
+    UNSPECIFIED = 0
+
 
 
 async def append_message(
@@ -43,7 +36,7 @@ async def append_message(
     session: AsyncSession,
     metadata_json: Optional[str] = None,
     *,
-    expected_head_id: Optional[str] = None,
+    expected_head_id: str | None | _ExpectedHead = _ExpectedHead.UNSPECIFIED,
 ) -> Message:
     """Добавляет реплику и обновляет ветку. Транзакцию завершает вызывающий код."""
     if role not in (MessageRole.USER, MessageRole.MODEL):
@@ -55,9 +48,9 @@ async def append_message(
         )
 
     head_id = branch.head_message_id
-    if expected_head_id is not None and head_id != expected_head_id:
+    if expected_head_id is not _ExpectedHead.UNSPECIFIED and head_id != expected_head_id:
         raise BranchConflictError("Состояние ветки изменилось. Повторите операцию.")
-    if not await message_belongs_to_chat(chat_id, head_id, session):
+    if head_id is not None and not await message_belongs_to_chat(chat_id, head_id, session):
         raise GraphIntegrityError(f"Некорректная вершина ветки в чате {chat_id}.")
     await reserve_branch_write(session, branch.id, head_id, branch.last_merged_message_id)
 
@@ -84,22 +77,3 @@ async def append_message(
 
     await session.flush()
     return new_msg
-
-
-async def get_latest_merge_event(
-    chat_id: str,
-    branch_name: str,
-    session: AsyncSession,
-) -> Optional[MergeEvent]:
-    """Возвращает последний хронологический узел слияния для указанной ветки."""
-    stmt = (
-        select(MergeEvent)
-        .where(
-            MergeEvent.chat_id == chat_id,
-            MergeEvent.source_branch_name == branch_name,
-        )
-        .order_by(MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
-        .execution_options(populate_existing=True)
-        .limit(1)
-    )
-    return (await session.execute(stmt)).scalar_one_or_none()

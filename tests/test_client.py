@@ -61,6 +61,14 @@ def test_map_messages_empty_list() -> None:
     assert map_messages_to_gemini([]) == []
 
 
+def test_truncated_response_is_not_final() -> None:
+    response = types.GenerateContentResponse(candidates=[types.Candidate(
+        finish_reason=types.FinishReason.MAX_TOKENS,
+        content=types.Content(role="model", parts=[types.Part.from_text(text="Partial")]),
+    )])
+    assert GeminiClient.extract_response_text(response) == ""
+
+
 @pytest.mark.asyncio
 async def test_default_model_used_for_generation_and_summary(
     monkeypatch: pytest.MonkeyPatch,
@@ -124,6 +132,7 @@ async def test_gemini_client_summarize_delta_formats_prompt() -> None:
     """Проверка формирования контекстного моста при инкрементальной суммаризации дельты."""
     mock_response = MagicMock()
     mock_response.text = "  Сжатый итог ветки.  "
+    mock_response.candidates = []
 
     delta = [
         Message(

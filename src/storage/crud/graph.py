@@ -1,10 +1,12 @@
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Literal, Optional, TypedDict
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, literal_column, select, update
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from src.storage.models import (
     Branch,
@@ -47,10 +49,48 @@ class NoActiveMessagesToMergeError(GraphEngineError):
     """Исключение: отсутствуют активные сообщения для слияния ветки."""
 
 
+class EditSuccess(TypedDict):
+    status: Literal["success"]
+    message_id: str
+
+
+class EditWarning(TypedDict):
+    status: Literal["warning_required"]
+    affected_branch_count: int
+    message: str
+
+
+class MergeResult(TypedDict):
+    status: Literal["success"]
+    merge_message_id: str
+    source_branch: str
+    target_branch: str
+    compressed_messages_count: int
+    summary: str
+
+
+async def get_branch(chat_id: str, branch_name: str, session: AsyncSession) -> Optional[Branch]:
+    return await session.scalar(
+        select(Branch).where(Branch.chat_id == chat_id, Branch.name == branch_name)
+    )
+
+
+async def get_latest_merge_event(
+    chat_id: str, branch_name: str, session: AsyncSession,
+) -> Optional[MergeEvent]:
+    return await session.scalar(
+        select(MergeEvent)
+        .where(MergeEvent.chat_id == chat_id, MergeEvent.source_branch_name == branch_name)
+        .order_by(MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+        .execution_options(populate_existing=True)
+        .limit(1)
+    )
+
+
 async def reserve_branch_write(
     session: AsyncSession,
     branch_id: str,
-    head_id: str,
+    head_id: str | None,
     last_merged_id: Optional[str],
 ) -> None:
     """Проверяет состояние ветки и удерживает право записи SQLite до конца транзакции."""
@@ -75,11 +115,7 @@ async def reconstruct_context(
     session: AsyncSession,
 ) -> list[Message]:
     """Возвращает активные узлы ветки в порядке истории."""
-    stmt = select(Branch).where(
-        Branch.chat_id == chat_id,
-        Branch.name == branch_name,
-    )
-    branch = (await session.execute(stmt)).scalar_one_or_none()
+    branch = await get_branch(chat_id, branch_name, session)
     if not branch:
         raise BranchNotFoundError(
             f"Ветка '{branch_name}' не найдена в чате {chat_id}"
@@ -89,7 +125,7 @@ async def reconstruct_context(
 
 
 async def read_context_from_head(
-    chat_id: str, head_id: str, session: AsyncSession,
+    chat_id: str, head_id: str | None, session: AsyncSession,
 ) -> list[Message]:
     """Читает активные узлы от заданной вершины."""
     history = await _read_history(chat_id, head_id, session)
@@ -98,7 +134,7 @@ async def read_context_from_head(
 
 async def _read_history(
     chat_id: str,
-    head_id: str,
+    head_id: str | None,
     session: AsyncSession,
     *,
     stop_id: Optional[str] = None,
@@ -140,25 +176,22 @@ async def branch_from_here(
             f"Узел {target_message_id} не найден в чате {chat_id}"
         )
 
-    stmt_check = select(Branch).where(
-        Branch.chat_id == chat_id,
-        Branch.name == new_branch_name,
+    statement = (
+        insert(Branch)
+        .values(
+            id=str(uuid.uuid4()), chat_id=chat_id, name=new_branch_name,
+            head_message_id=target_message_id, forked_from_id=target_message_id,
+            status=BranchStatus.ACTIVE,
+        )
+        .on_conflict_do_nothing(index_elements=[Branch.chat_id, Branch.name])
+        .returning(Branch)
     )
-    if (await session.execute(stmt_check)).scalar_one_or_none():
+    new_branch = await session.scalar(statement)
+    if new_branch is None:
         raise BranchAlreadyExistsError(
             f"Ветка '{new_branch_name}' уже существует в чате {chat_id}"
         )
 
-    new_branch = Branch(
-        id=str(uuid.uuid4()),
-        chat_id=chat_id,
-        name=new_branch_name,
-        head_message_id=target_message_id,
-        forked_from_id=target_message_id,
-        status=BranchStatus.ACTIVE,
-    )
-    session.add(new_branch)
-    await session.flush()
     return new_branch
 
 
@@ -166,15 +199,15 @@ async def update_message_content(
     message_id: str,
     new_content: str,
     force: bool = False,
-    session: Optional[AsyncSession] = None,
-) -> dict[str, Any]:
+    *,
+    session: AsyncSession,
+) -> EditSuccess | EditWarning:
     """Модифицирует текст сообщения. Транзакцию завершает вызывающий код."""
-    if session is None:
-        raise ValueError("Требуется активная асинхронная сессия БД.")
-
     msg = await session.get(Message, message_id)
     if not msg:
         raise MessageNotFoundError(f"Сообщение {message_id} не найдено")
+    if msg.content == new_content:
+        return {"status": "success", "message_id": message_id}
 
     if not force:
         messages = Message.__table__
@@ -212,41 +245,35 @@ async def toggle_message_active(
     session: AsyncSession,
 ) -> bool:
     """Инвертирует флаг присутствия в контексте. Транзакцию завершает вызывающий код."""
-    msg = await session.get(Message, message_id)
-    if not msg:
+    messages = Message.__table__
+    new_state = await session.scalar(
+        update(messages).where(messages.c.id == message_id)
+        .values(is_active=~messages.c.is_active).returning(messages.c.is_active)
+    )
+    if new_state is None:
         raise MessageNotFoundError(f"Сообщение {message_id} не найдено")
 
-    msg.is_active = not msg.is_active
-    await session.flush()
-    return msg.is_active
+    if (msg := await session.get(Message, message_id)) is not None:
+        set_committed_value(msg, "is_active", new_state)
+    return new_state
 
 
 async def squash_merge_branch(
     chat_id: str,
     source_branch_name: str,
     target_branch_name: str = "main",
-    summarizer_func: Optional[Callable[..., Any]] = None,
-    session: Optional[AsyncSession] = None,
-) -> dict[str, Any]:
+    *,
+    summarizer_func: Callable[[list[Message], str | None], Awaitable[str]],
+    session: AsyncSession,
+) -> MergeResult:
     """Сливает активную дельту. Транзакцию завершает вызывающий код."""
-    if session is None or summarizer_func is None:
-        raise ValueError("Требуются сессия БД и функция суммаризации.")
     if source_branch_name == target_branch_name:
         raise InvalidMergeError("Нельзя слить ветку в саму себя.")
     if target_branch_name != "main":
         raise InvalidMergeError("Слияние разрешено только в main.")
 
-    stmt_source = select(Branch).where(
-        Branch.chat_id == chat_id,
-        Branch.name == source_branch_name,
-    )
-    source_branch = (await session.execute(stmt_source)).scalar_one_or_none()
-
-    stmt_target = select(Branch).where(
-        Branch.chat_id == chat_id,
-        Branch.name == target_branch_name,
-    )
-    target_branch = (await session.execute(stmt_target)).scalar_one_or_none()
+    source_branch = await get_branch(chat_id, source_branch_name, session)
+    target_branch = await get_branch(chat_id, target_branch_name, session)
 
     if not source_branch or not target_branch:
         raise BranchNotFoundError("Исходная или целевая ветка не найдена.")
@@ -257,16 +284,21 @@ async def squash_merge_branch(
     target_last_merged_id = target_branch.last_merged_message_id
     start_node_id = source_last_merged_id or source_branch.forked_from_id
 
-    if not await message_belongs_to_chat(chat_id, target_head_id, session):
+    if target_head_id is not None and not await message_belongs_to_chat(chat_id, target_head_id, session):
         raise GraphIntegrityError(f"Некорректная вершина целевой ветки в чате {chat_id}.")
     delta = await _read_history(chat_id, source_head_id, session, stop_id=start_node_id)
     active_delta = [msg for msg in reversed(delta) if msg.is_active]
-    if not active_delta:
+    if not active_delta or source_head_id is None:
         raise NoActiveMessagesToMergeError(
             "Отсутствуют активные сообщения для слияния."
         )
 
-    summary_text = await summarizer_func(active_delta)
+    previous = (
+        await get_latest_merge_event(chat_id, source_branch_name, session)
+        if source_last_merged_id is not None else None
+    )
+    previous_summary = previous.content if previous is not None and previous.is_active else None
+    summary_text = await summarizer_func(active_delta, previous_summary)
     if not isinstance(summary_text, str) or not summary_text.strip():
         raise InvalidMergeError("Суммаризатор вернул пустую или некорректную выжимку.")
 
@@ -285,7 +317,7 @@ async def squash_merge_branch(
         content=summary_text,
         is_active=True,
         source_branch_name=source_branch_name,
-        forked_from_msg_id=start_node_id or target_head_id,
+        forked_from_msg_id=start_node_id or target_head_id or source_head_id,
         compressed_messages_count=len(active_delta),
     )
     session.add(merge_msg)

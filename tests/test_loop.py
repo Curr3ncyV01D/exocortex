@@ -2,7 +2,7 @@ import asyncio
 import json
 import uuid
 from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -18,40 +18,93 @@ from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
 
 
-def _make_text_response(text: Optional[str]) -> MagicMock:
-    """Создает мок-ответ SDK с финальным текстовым сообщением."""
-    resp = MagicMock(spec=types.GenerateContentResponse)
-    resp.function_calls = []
-    resp.text = text
-    content = (
-        types.Content(role="model", parts=[types.Part.from_text(text=text)])
-        if text is not None
-        else None
-    )
-    resp.candidates = [MagicMock(content=content)] if content else []
-    return resp
+def _make_text_response(text: Optional[str]) -> types.GenerateContentResponse:
+    if text is None:
+        return types.GenerateContentResponse()
+    return types.GenerateContentResponse(candidates=[types.Candidate(
+        finish_reason=types.FinishReason.STOP,
+        content=types.Content(role="model", parts=[types.Part.from_text(text=text)]),
+    )])
 
 
 def _make_tool_call_response(
     calls: list[tuple[str, dict[str, Any]]],
-) -> MagicMock:
-    """Создает мок-ответ SDK с запросом на вызов одного или нескольких инструментов."""
-    resp = MagicMock(spec=types.GenerateContentResponse)
-    call_mocks = []
-    parts = []
-    for name, args in calls:
-        c = MagicMock()
-        c.name = name
-        c.args = args
-        call_mocks.append(c)
-        parts.append(types.Part.from_function_call(name=name, args=args))
-
-    resp.function_calls = call_mocks
-    resp.text = None
-    resp.candidates = [
-        MagicMock(content=types.Content(role="model", parts=parts))
+) -> types.GenerateContentResponse:
+    parts = [
+        types.Part(function_call=types.FunctionCall(name=name, args=args, id=f"call-{index}"))
+        for index, (name, args) in enumerate(calls)
     ]
-    return resp
+    return types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(role="model", parts=parts),
+    )])
+
+
+@pytest.mark.asyncio
+async def test_blank_prompt_does_not_call_gemini(session, initial_chat_setup):
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(ValueError, match="Промпт"):
+            await run_turn(initial_chat_setup["chat_id"], "main", client, session, "  ")
+        client.generate_step.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turn_deadline_releases_lock_and_keeps_question(
+    session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+
+        async def slow_generation(**kwargs):
+            await asyncio.sleep(1)
+
+        client.generate_step = AsyncMock(side_effect=slow_generation)
+        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 0.25)
+        with pytest.raises(LLMGenerationError, match="лимит времени"):
+            await run_turn(chat_id, "main", client, session, "Question")
+        assert not session.in_transaction()
+        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 90)
+        client.generate_step = AsyncMock(return_value=_make_text_response("Recovered"))
+        answer = await run_turn(chat_id, "main", client, session)
+        question = await session.get(Message, answer.parent_id)
+        assert question is not None and question.content == "Question"
+
+
+@pytest.mark.asyncio
+async def test_turn_budget_rejects_large_context(session, initial_chat_setup, monkeypatch):
+    monkeypatch.setattr("src.agent.loop.MAX_CONTEXT_BYTES", 1)
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock()
+        with pytest.raises(LLMGenerationError, match="Контекст"):
+            await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+        client.generate_step.assert_not_awaited()
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_turn_call_limit_falls_back_without_running_excess_batch(
+    session, initial_chat_setup, monkeypatch,
+):
+    monkeypatch.setattr("src.agent.loop.MAX_TOOL_CALLS", 1)
+    with patch("src.agent.client.genai.Client"), patch(
+        "src.agent.loop.search_history_fts", new_callable=AsyncMock,
+    ) as search:
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([
+                ("search_history", {"query": "one"}),
+                ("search_history", {"query": "two"}),
+            ]),
+            _make_text_response("Fallback"),
+        ])
+        answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+    assert answer.content == "Fallback"
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    search.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -141,6 +194,8 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
     assert trace["steps"][0]["tool_called"] == "search_history"
     assert trace["steps"][0]["arguments"] == {"query": "FastAPI"}
     assert "FastAPI" in trace["steps"][0]["output_summary"]
+    history = client.generate_step.await_args_list[1].kwargs["contents"]
+    assert history[-1].parts[0].function_response.id == "call-0"
 
 
 @pytest.mark.asyncio
@@ -151,6 +206,7 @@ async def test_run_turn_excludes_every_context_node_from_search(
     chat_id = initial_chat_setup["chat_id"]
     first = await append_message(chat_id, "main", MessageRole.MODEL, "Archive first", session)
     second = await append_message(chat_id, "main", MessageRole.MODEL, "Archive second", session)
+    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id]
     await session.commit()
 
     with patch("src.agent.client.genai.Client"), patch(
@@ -164,9 +220,7 @@ async def test_run_turn_excludes_every_context_node_from_search(
         ])
         await run_turn(chat_id, "main", client, session)
 
-    assert search.await_args.kwargs["exclude_message_ids"] == [
-        initial_chat_setup["root_message_id"], first.id, second.id,
-    ]
+    assert search.await_args.kwargs["exclude_message_ids"] == expected_ids
 
 
 @pytest.mark.asyncio
@@ -318,6 +372,7 @@ async def test_run_turn_rejects_head_changed_by_merge(
         await session.commit()
 
     async def generate_after_merge(**kwargs):
+        assert not session.in_transaction()
         async with file_sessions() as writer:
             await squash_merge_branch(
                 chat_id, "side", summarizer_func=AsyncMock(return_value="Summary"), session=writer,
@@ -357,7 +412,7 @@ async def test_merge_rejects_branch_changed_during_summary(
         await append_message(chat_id, "side", MessageRole.USER, "Side delta", session)
         await session.commit()
 
-    async def summarize_after_append(delta):
+    async def summarize_after_append(delta, previous_summary=None):
         async with file_sessions() as writer:
             await append_message(chat_id, changed_branch, MessageRole.USER, "Concurrent update", writer)
             await writer.commit()
@@ -510,7 +565,7 @@ async def test_run_turn_concurrent_branch_lock_raises_busy(
     generation_started = asyncio.Event()
     allow_finish = asyncio.Event()
 
-    async def slow_generate(*args: Any, **kwargs: Any) -> MagicMock:
+    async def slow_generate(*args: Any, **kwargs: Any) -> types.GenerateContentResponse:
         generation_started.set()
         await allow_finish.wait()
         return _make_text_response("Ответ первого запроса")

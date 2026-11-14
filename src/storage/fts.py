@@ -1,8 +1,21 @@
 import re
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime
 
-from sqlalchemy import Row, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.storage.models import Message, MessageRole
+
+MAX_SEARCH_RESULTS = 10
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    id: str
+    role: MessageRole
+    content: str
+    created_at: datetime
 
 
 class FTSQueryBuilder:
@@ -25,7 +38,7 @@ class FTSQueryBuilder:
     @classmethod
     def build(cls, raw_query: str) -> str:
         """Преобразует пользовательский запрос в безопасный поисковый терм FTS5."""
-        tokens = re.findall(r"\w+", raw_query)
+        tokens = re.findall(r"[^\W_]+", raw_query)
         if not tokens:
             return ""
 
@@ -36,7 +49,7 @@ class FTSQueryBuilder:
                 processed_parts.append(f'"{upper_token}"')
             else:
                 base = cls.stem_word(token)
-                processed_parts.append(f"{base}*")
+                processed_parts.append(f'"{base}"*')
 
         return " ".join(processed_parts)
 
@@ -47,8 +60,11 @@ async def query_messages_fts(
     exclude_ids: set[str],
     session: AsyncSession,
     limit: int = 5,
-) -> list[Row[Any]]:
+) -> list[SearchHit]:
     """Выполняет полнотекстовый поиск по индексу messages_fts с фильтрацией активного контекста."""
+    if limit <= 0:
+        return []
+    limit = min(limit, MAX_SEARCH_RESULTS)
     sanitized_query = FTSQueryBuilder.build(raw_query)
     if not sanitized_query:
         return []
@@ -62,9 +78,9 @@ async def query_messages_fts(
         WHERE messages_fts MATCH :query
           AND m.chat_id = :chat_id
           AND m.is_active = 1
-        ORDER BY rank
+        ORDER BY rank, m.id
         LIMIT :fetch_limit
-    """)
+    """).columns(Message.id, Message.role, Message.content, Message.created_at)
 
     result = await session.execute(
         stmt,
@@ -76,11 +92,11 @@ async def query_messages_fts(
     )
     rows = result.fetchall()
 
-    filtered_rows: list[Row[Any]] = []
+    filtered_rows: list[SearchHit] = []
     for row in rows:
         if row.id in exclude_ids:
             continue
-        filtered_rows.append(row)
+        filtered_rows.append(SearchHit(row.id, row.role, row.content, row.created_at))
         if len(filtered_rows) >= limit:
             break
 

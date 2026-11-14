@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from sqlalchemy import event, text
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncAttrs,
     AsyncEngine,
@@ -74,10 +74,22 @@ class Base(AsyncAttrs, DeclarativeBase):
 
 async def init_db(target_engine: AsyncEngine = engine) -> None:
     """Инициализирует реляционные таблицы и виртуальный полнотекстовый индекс FTS5 с триггерами."""
+    import src.storage.models  # Регистрирует таблицы в Base.metadata.
+
     async with target_engine.begin() as conn:
+        await conn.exec_driver_sql("BEGIN IMMEDIATE")
         await conn.run_sync(Base.metadata.create_all)
+        objects = await conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE name IN "
+            "('messages_fts', 'messages_ai', 'messages_ad', 'messages_au')"
+        )
+        needs_rebuild = len(objects.all()) != 4
         for statement in FTS_STATEMENTS:
-            await conn.execute(text(statement))
+            await conn.exec_driver_sql(statement)
+        if needs_rebuild:
+            await conn.exec_driver_sql(
+                "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')"
+            )
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

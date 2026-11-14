@@ -2,7 +2,7 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -10,6 +10,7 @@ from src.agent.client import map_messages_to_gemini
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
     BranchAlreadyExistsError,
+    BranchConflictError,
     BranchNotFoundError,
     GraphIntegrityError,
     InvalidMergeError,
@@ -23,6 +24,87 @@ from src.storage.crud.graph import (
 )
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
+
+
+@pytest.mark.asyncio
+async def test_same_content_preserves_edit_metadata(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    root_id = initial_chat_setup["root_message_id"]
+    result = await update_message_content(root_id, "Root prompt", session=session)
+    message = await session.get(Message, root_id)
+    assert result["status"] == "success"
+    assert message is not None and not message.is_edited
+    assert message.updated_at is None
+
+
+@pytest.mark.asyncio
+async def test_reconstruct_context_rejects_cycle(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    root_id = initial_chat_setup["root_message_id"]
+    await session.execute(
+        text("UPDATE messages SET parent_id = id WHERE id = :id"), {"id": root_id},
+    )
+    with pytest.raises(GraphIntegrityError):
+        await reconstruct_context(initial_chat_setup["chat_id"], "main", session)
+
+
+@pytest.mark.asyncio
+async def test_first_append_creates_root_on_empty_branch(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    chat_id = initial_chat_setup["chat_id"]
+    branch = Branch(chat_id=chat_id, name="empty")
+    session.add(branch)
+    await session.flush()
+    assert await reconstruct_context(chat_id, "empty", session) == []
+    first = await append_message(
+        chat_id, "empty", MessageRole.USER, "First", session, expected_head_id=None,
+    )
+    assert first.parent_id is None
+    assert branch.head_message_id == first.id
+    with pytest.raises(BranchConflictError):
+        await append_message(
+            chat_id, "empty", MessageRole.USER, "Stale", session, expected_head_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_branch_from_stale_reader_uses_domain_error(
+    file_sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with file_sessions() as first:
+        setup = await create_initial_chat(first)
+        chat_id, root_id = setup["chat_id"], setup["root_message_id"]
+        assert await first.get(Message, root_id) is not None
+        async with file_sessions.begin() as second:
+            await branch_from_here(chat_id, root_id, "side", second)
+        with pytest.raises(BranchAlreadyExistsError):
+            await branch_from_here(chat_id, root_id, "side", first)
+        count = await first.scalar(
+            select(func.count()).select_from(Branch).where(Branch.name == "side")
+        )
+        assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mask_toggles_compose(
+    file_sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with file_sessions() as first:
+        root_id = (await create_initial_chat(first))["root_message_id"]
+        root = await first.get(Message, root_id)
+        assert root is not None and root.is_active
+        async with file_sessions.begin() as second:
+            assert await toggle_message_active(root_id, second) is False
+        assert await toggle_message_active(root_id, first) is True
+        await first.commit()
+
+    async with file_sessions() as session:
+        root = await session.get(Message, root_id)
+        assert root is not None and root.is_active
+        assert root.updated_at is None
 
 
 @pytest.mark.asyncio
@@ -254,7 +336,9 @@ async def test_merge_rejects_invalid_branches(
     summarizer = AsyncMock(return_value="Summary")
 
     with pytest.raises(InvalidMergeError):
-        await squash_merge_branch(chat_id, source, target, summarizer, session)
+        await squash_merge_branch(
+            chat_id, source, target, summarizer_func=summarizer, session=session,
+        )
 
     summarizer.assert_not_awaited()
     assert await session.scalar(select(MergeEvent.id)) is None
@@ -280,7 +364,7 @@ async def test_invalid_summary_preserves_delta_for_retry(
     assert [msg.id for msg in await reconstruct_context(chat_id, "main", session)] == [root_id]
     summarizer = AsyncMock(return_value="Valid summary")
     await squash_merge_branch(chat_id, "side", summarizer_func=summarizer, session=session)
-    summarizer.assert_awaited_once_with([delta])
+    summarizer.assert_awaited_once_with([delta], None)
 
 
 @pytest.mark.asyncio
@@ -300,7 +384,7 @@ async def test_unmasked_message_before_merge_checkpoint_stays_out_of_delta(
     new = await append_message(chat_id, "side", MessageRole.USER, "New", session)
     summary.reset_mock()
     await squash_merge_branch(chat_id, "side", summarizer_func=summary, session=session)
-    summary.assert_awaited_once_with([new])
+    summary.assert_awaited_once_with([new], "Summary")
 
 
 @pytest.mark.asyncio
@@ -544,6 +628,7 @@ async def test_squash_merge_second_incremental_merge(
     )
 
     passed_delta = mock_summarizer_2.call_args.args[0]
+    assert mock_summarizer_2.await_args.args[1] == "Merge Summary 1"
     assert [m.id for m in passed_delta] == [msg_b3_id, msg_b4_id]
     assert res2["compressed_messages_count"] == 2
 
@@ -552,6 +637,14 @@ async def test_squash_merge_second_incremental_merge(
 
     await session.refresh(branch)
     assert branch.last_merged_message_id == msg_b4_id
+
+    await toggle_message_active(res2["merge_message_id"], session)
+    await append_message(chat_id, branch.name, MessageRole.USER, "Step 5", session)
+    mock_summarizer_3 = AsyncMock(return_value="Merge Summary 3")
+    await squash_merge_branch(
+        chat_id, branch.name, summarizer_func=mock_summarizer_3, session=session,
+    )
+    assert mock_summarizer_3.await_args.args[1] is None
 
 
 @pytest.mark.asyncio
