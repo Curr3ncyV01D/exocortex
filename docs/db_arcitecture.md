@@ -15,7 +15,7 @@ erDiagram
     CHATS ||--o{ MESSAGES : "содержит (1:N)"
     MESSAGES ||--o{ MESSAGES : "ссылается на родителя (parent_id)"
     MESSAGES ||--o| MERGE_EVENTS : "полиморфно расширяется (1:0..1)"
-    BRANCHES }o--|| MESSAGES : "указывает на head_message_id"
+    BRANCHES }o--o| MESSAGES : "указывает на head_message_id"
     BRANCHES }o--o| MESSAGES : "отпочкована от forked_from_id"
     BRANCHES }o--o| MESSAGES : "слита до last_merged_message_id"
 
@@ -79,7 +79,7 @@ erDiagram
 | `id` | `VARCHAR(36)` | `PK` | Уникальный идентификатор ветки (UUIDv4). |
 | `chat_id` | `VARCHAR(36)` | `FK (chats.id) ON DELETE CASCADE, NOT NULL` | Контекстная принадлежность ветки к чату. |
 | `name` | `VARCHAR(64)` | `NOT NULL` | Символьное имя ветки (`main`, `feature/fastapi`). |
-| `head_message_id` | `VARCHAR(36)` | `FK (messages.id), NOT NULL` | Указатель на терминальный узел (актуальная вершина ветки). |
+| `head_message_id` | `VARCHAR(36)` | Составной FK, `NULLABLE` | Указатель на терминальный узел (актуальная вершина ветки). |
 | `last_merged_message_id` | `VARCHAR(36)` | `FK (messages.id), NULLABLE` | Узел фиксации последнего слияния (база для инкрементального мёрджа). |
 | `forked_from_id` | `VARCHAR(36)` | `FK (messages.id), NULLABLE` | Узел родительской ветки, от которого был выполнен форк. |
 | `status` | `VARCHAR(20)` | `NOT NULL, DEFAULT 'active'` | Статус ветки: `active`, `merged`, `archived`. |
@@ -122,7 +122,7 @@ erDiagram
 
 SQLite проверяет пару `(chat_id, id)` в `messages`. С этой парой сравниваются `(chat_id, parent_id)` сообщения, пары для `head_message_id`, `forked_from_id` и `last_merged_message_id` ветки, а также `(chat_id, message_id)` и `(chat_id, forked_from_msg_id)` события слияния. В `merge_events` хранится отдельный `chat_id`, а ограничение `UNIQUE (chat_id, id)` в `messages` позволяет ссылаться на эту пару.
 
-Эта схема применяется при создании базы с нуля. Для старой схемы миграция не предусмотрена.
+Эта схема применяется при создании базы с нуля. Пустая ветка имеет `head_message_id = NULL`. Для старой схемы миграция не предусмотрена. Инициализация создаёт таблицы и FTS-триггеры одной транзакцией и заполняет индекс, если таблица FTS или триггеры были добавлены впервые.
 
 ### 2.5. Виртуальная таблица `messages_fts` (Полнотекстовый индекс FTS5)
 Обеспечивает детерминированный полнотекстовый поиск по всей глубине истории чата.
