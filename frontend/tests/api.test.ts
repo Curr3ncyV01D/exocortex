@@ -1,0 +1,51 @@
+import { describe, expect, it, vi } from 'vitest'
+import { api, ApiError } from '../src/api/client'
+import { chat, main, timeline } from './fixtures'
+
+describe('REST API client', () => {
+  it('loads chats, branches and the branch timeline with masked messages', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json([chat]))
+      .mockResolvedValueOnce(Response.json([main]))
+      .mockResolvedValueOnce(Response.json(timeline))
+    vi.stubGlobal('fetch', fetchMock)
+    const signal = new AbortController().signal
+
+    expect(await api.listChats(signal)).toEqual([chat])
+    expect(await api.listBranches(chat.id, signal)).toEqual([main])
+    expect(await api.getTimeline(main.id, signal)).toEqual(timeline)
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/chats',
+      '/api/v1/chats/chat-1/branches',
+      '/api/v1/branches/branch-main/timeline?include_inactive=true',
+    ])
+    expect(fetchMock.mock.calls.every(([, options]) => options.signal === signal)).toBe(true)
+  })
+
+  it('creates a chat with a JSON body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(chat, { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    expect(await api.createChat(chat.title)).toEqual(chat)
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/chats', expect.objectContaining({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: chat.title }),
+    }))
+  })
+
+  it('keeps the HTTP status and structured error body for callers', async () => {
+    const body = { detail: 'Ветка не найдена.' }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(body, { status: 404 })))
+
+    const failure = api.getTimeline(main.id)
+    await expect(failure).rejects.toBeInstanceOf(ApiError)
+    await expect(failure).rejects.toMatchObject({ status: 404, message: body.detail, body })
+  })
+
+  it('reports non-JSON HTTP failures with their status', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('Bad gateway', { status: 502 })))
+
+    await expect(api.listChats()).rejects.toMatchObject({ status: 502 })
+  })
+})

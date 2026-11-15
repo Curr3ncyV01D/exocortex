@@ -1,7 +1,111 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: #131314;
+  --color-panel: #1b1c1d;
+  --color-surface: #242628;
+  --color-line: #37393d;
+  --color-muted: #b0b6be;
+  --color-foreground: #eceef1;
+  --color-accent: #aac7ff;
+  --color-accent-ink: #162f56;
+}
+
 @layer base {
   body {
-    @apply bg-slate-950 text-slate-100 antialiased;
+    @apply bg-canvas text-foreground antialiased;
+    color-scheme: dark;
+  }
+
+  :where(button, input, select, a):focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent;
+  }
+}
+
+@layer components {
+  .button-secondary {
+    @apply rounded-lg border border-line px-2.5 py-1.5 text-sm font-medium text-foreground;
+    @apply hover:bg-surface disabled:opacity-50;
+  }
+
+  .field {
+    @apply rounded-lg border border-line bg-panel px-2.5 py-1.5 text-sm text-foreground;
+  }
+
+  .message-card {
+    @apply min-w-0 rounded-xl border border-line bg-panel px-4 py-4 md:px-5;
+  }
+
+  .message-card[data-role="user"] {
+    @apply bg-surface;
+  }
+
+  .message-card[data-role="model"] .message-role {
+    @apply text-accent;
+  }
+
+  .message-card[data-role="system_merge"] {
+    @apply border-l-4 border-l-emerald-500/60;
+  }
+
+  .message-card[data-role="system_merge"] .message-role {
+    @apply text-emerald-300;
+  }
+
+  .message-card[data-active="false"] {
+    @apply border-dashed bg-canvas text-muted;
+  }
+
+  .message-markdown {
+    @apply text-sm leading-relaxed wrap-anywhere md:text-base;
+
+    > * + * {
+      @apply mt-3;
+    }
+
+    :where(h1, h2, h3, h4, h5, h6) {
+      @apply font-semibold;
+    }
+
+    :where(h1, h2) {
+      @apply text-lg;
+    }
+
+    a {
+      @apply text-accent underline underline-offset-2;
+    }
+
+    ul {
+      @apply list-disc pl-6;
+    }
+
+    ol {
+      @apply list-decimal pl-6;
+    }
+
+    blockquote {
+      @apply border-l-2 border-line pl-3 text-muted;
+    }
+
+    pre {
+      @apply overflow-x-auto rounded-lg border border-line bg-canvas p-3 text-sm;
+    }
+
+    :not(pre) > code {
+      @apply rounded bg-canvas px-1 font-mono text-sm;
+    }
+
+    table {
+      @apply block max-w-full overflow-x-auto;
+    }
+
+    :where(th, td) {
+      @apply border border-line px-3 py-1.5 text-left;
+    }
+
+    img {
+      @apply max-w-full rounded-lg;
+    }
   }
 }
