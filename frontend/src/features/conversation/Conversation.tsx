@@ -1,9 +1,10 @@
+import type { ReactNode } from 'react'
 import { LoadError } from '../../components/LoadError'
 import { useWorkspace } from '../../store/workspace'
 import { BranchPicker } from '../branches/BranchPicker'
 import { MessageTimeline } from './MessageTimeline'
 
-export function Conversation() {
+export function Conversation({ navigation }: { navigation: ReactNode }) {
   const chats = useWorkspace((state) => state.chats)
   const branches = useWorkspace((state) => state.branches)
   const activeChatId = useWorkspace((state) => state.activeChatId)
@@ -14,19 +15,22 @@ export function Conversation() {
   const chat = chats.status === 'ready' ? chats.data.find(({ id }) => id === activeChatId) : undefined
 
   return (
-    <main className="flex min-h-0 min-w-0 flex-col">
-      <header className="border-b border-line bg-canvas">
-        <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-5 py-5 md:px-9 md:py-6">
-          <h1 className="min-w-0 max-w-full text-xl font-semibold tracking-tight wrap-anywhere md:text-2xl">
+    <main className="workspace-island flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-line/70">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 px-4 py-3 md:px-6">
+          <h1 className="min-w-0 max-w-full text-base font-semibold tracking-tight wrap-anywhere md:text-lg">
             {chat?.title ?? 'История чата'}
           </h1>
-          {branches.status === 'ready' && activeBranchId && (
-            <BranchPicker branches={branches.data} activeBranchId={activeBranchId} onSelect={selectBranch} />
-          )}
+          <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+            {branches.status === 'ready' && activeBranchId && (
+              <BranchPicker branches={branches.data} activeBranchId={activeBranchId} onSelect={selectBranch} />
+            )}
+            {navigation}
+          </div>
         </div>
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-5xl px-5 py-7 md:px-9 md:py-9">
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="conversation-column py-4 md:py-6">
           {chats.status === 'ready' && !chat && (
             <p className="text-sm text-muted">Создайте чат, чтобы открыть его историю.</p>
           )}

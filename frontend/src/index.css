@@ -2,14 +2,13 @@
 
 @theme {
   --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
-  --color-canvas: #131314;
-  --color-panel: #1b1c1d;
-  --color-surface: #242628;
-  --color-line: #37393d;
+  --color-canvas: #0b0b0c;
+  --color-panel: #161718;
+  --color-surface: #222427;
+  --color-line: #ffffff2b;
   --color-muted: #b0b6be;
   --color-foreground: #eceef1;
   --color-accent: #aac7ff;
-  --color-accent-ink: #162f56;
 }
 
 @layer base {
@@ -18,12 +17,45 @@
     color-scheme: dark;
   }
 
-  :where(button, input, select, a):focus-visible {
+  :where(button, input, select, a, summary):focus-visible {
     @apply outline-2 outline-offset-2 outline-accent;
   }
 }
 
 @layer components {
+  .workspace-island {
+    @apply rounded-2xl border border-white/10 bg-panel;
+  }
+
+  dialog.workspace-island > aside {
+    border: 0;
+  }
+
+  .workspace-separator {
+    @apply relative outline-none;
+  }
+
+  .workspace-separator::after {
+    content: "";
+    @apply pointer-events-none absolute rounded-full bg-transparent;
+  }
+
+  .workspace-separator[aria-orientation="vertical"]::after {
+    @apply inset-y-3 left-1/2 w-0.5 -translate-x-1/2;
+  }
+
+  .workspace-separator[aria-orientation="horizontal"]::after {
+    @apply inset-x-3 top-1/2 h-0.5 -translate-y-1/2;
+  }
+
+  .workspace-separator:is(:hover, :focus-visible, [data-separator="active"])::after {
+    @apply bg-accent/65;
+  }
+
+  .conversation-column {
+    @apply mx-auto w-full max-w-3xl px-3 md:px-6;
+  }
+
   .button-secondary {
     @apply rounded-lg border border-line px-2.5 py-1.5 text-sm font-medium text-foreground;
     @apply hover:bg-surface disabled:opacity-50;
@@ -34,27 +66,50 @@
   }
 
   .message-card {
-    @apply min-w-0 rounded-xl border border-line bg-panel px-4 py-4 md:px-5;
+    @apply min-w-0 rounded-xl border border-transparent px-3 py-3 md:px-4;
   }
 
-  .message-card[data-role="user"] {
-    @apply bg-surface;
-  }
-
-  .message-card[data-role="model"] .message-role {
-    @apply text-accent;
-  }
-
-  .message-card[data-role="system_merge"] {
-    @apply border-l-4 border-l-emerald-500/60;
-  }
-
-  .message-card[data-role="system_merge"] .message-role {
-    @apply text-emerald-300;
+  .message-card:is([data-role="user"], [data-role="model"]):is(:hover, :focus-visible, :focus-within) {
+    @apply border-line;
   }
 
   .message-card[data-active="false"] {
-    @apply border-dashed bg-canvas text-muted;
+    @apply border-dashed border-line bg-canvas/35 text-muted;
+  }
+
+  @media (hover: hover) {
+    .message-card:not(:hover, :focus-within) .message-duration {
+      visibility: hidden;
+    }
+  }
+
+  .technical-details {
+    @apply rounded-xl border border-line text-sm;
+  }
+
+  .technical-details:has(+ .message-markdown) {
+    @apply mb-3;
+  }
+
+  .technical-details summary {
+    @apply flex cursor-pointer list-none items-center justify-between gap-3 rounded-xl px-3 py-2.5 font-medium;
+  }
+
+  .technical-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .technical-details summary::after {
+    content: "";
+    @apply mr-1 size-2 shrink-0 rotate-45 border-r border-b border-current text-muted;
+  }
+
+  .technical-details[open] summary::after {
+    @apply rotate-225;
+  }
+
+  .technical-body {
+    @apply border-t border-line px-3 py-3;
   }
 
   .message-markdown {

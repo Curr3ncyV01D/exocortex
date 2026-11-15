@@ -27,7 +27,7 @@ it('shows the main timeline, renders Markdown and keeps masked messages in order
     [timelineUrl(main.id)]: () => Response.json(timeline),
   })
   const firstRender = render(<App />)
-  await screen.findByText('Итог ветки')
+  await screen.findByText('Слияние ветки')
   firstRender.unmount()
   render(<App />)
 
@@ -39,7 +39,9 @@ it('shows the main timeline, renders Markdown and keeps masked messages in order
   expect(messages[1].querySelector('strong')).toHaveTextContent('Скрытый ответ')
   expect(messages[1].querySelector('pre > code')).toHaveTextContent('print(1)')
   expect(messages[2]).toHaveTextContent('Слияние ветки')
-  expect(messages[2]).toHaveTextContent('Итог ветки')
+  expect(within(messages[2]).getByText('Итог ветки')).not.toBeVisible()
+  await userEvent.click(within(messages[2]).getByText('Слияние ветки'))
+  expect(within(messages[2]).getByText('Итог ветки')).toBeVisible()
   expect(screen.getByRole('combobox', { name: 'Ветка' })).toHaveValue(main.id)
 })
 
@@ -61,7 +63,7 @@ it('ignores a late timeline response after switching branches', async () => {
   expect(await screen.findByText('В этой ветке пока нет сообщений.')).toBeVisible()
   await act(async () => { resolveMain(Response.json(timeline)) })
   expect(select).toHaveValue(side.id)
-  expect(screen.queryByText('Итог ветки')).not.toBeInTheDocument()
+  expect(screen.queryByText('Слияние ветки')).not.toBeInTheDocument()
 })
 
 it('retries a failed timeline request on the same branch', async () => {
@@ -77,7 +79,7 @@ it('retries a failed timeline request on the same branch', async () => {
 
   expect(await screen.findByRole('alert')).toHaveTextContent('История недоступна.')
   await userEvent.click(screen.getByRole('button', { name: 'Повторить загрузку' }))
-  expect(await screen.findByText('Итог ветки')).toBeVisible()
+  expect(await screen.findByText('Слияние ветки')).toBeVisible()
   expect(loadHistory).toHaveBeenCalledTimes(2)
 })
 
@@ -93,14 +95,15 @@ it('switches chats and scopes branch loading to the selected chat', async () => 
   })
   render(<App />)
 
-  await screen.findByText('Итог ветки')
+  await screen.findByText('Слияние ветки')
   await userEvent.click(screen.getByRole('button', { name: otherChat.title }))
   expect(await screen.findByText('В этой ветке пока нет сообщений.')).toBeVisible()
   expect(screen.getByRole('combobox', { name: 'Ветка' })).toHaveValue(otherBranch.id)
-  expect(screen.queryByText('Итог ветки')).not.toBeInTheDocument()
+  expect(screen.queryByText('Слияние ветки')).not.toBeInTheDocument()
 })
 
 it('creates a chat from an empty workspace and opens its main branch', async () => {
+  const user = userEvent.setup()
   const fetchMock = vi.fn(async (url: string, options: RequestInit) => {
     if (url === chatsUrl) {
       return options.method === 'POST' ? Response.json(chat, { status: 201 }) : Response.json([])
@@ -113,9 +116,9 @@ it('creates a chat from an empty workspace and opens its main branch', async () 
   render(<App />)
 
   await screen.findByText('Чатов пока нет.')
-  await userEvent.click(screen.getByRole('button', { name: 'Новый чат' }))
-  await userEvent.type(screen.getByRole('textbox', { name: 'Название чата' }), chat.title)
-  await userEvent.click(screen.getByRole('button', { name: 'Создать' }))
+  await user.click(screen.getByRole('button', { name: 'Новый чат' }))
+  screen.getByRole('textbox', { name: 'Название чата' }).focus()
+  await user.keyboard(`${chat.title}{Enter}`)
 
   expect(await screen.findByText('В этой ветке пока нет сообщений.')).toBeVisible()
   expect(screen.getByRole('button', { name: chat.title })).toHaveAttribute('aria-current', 'true')
