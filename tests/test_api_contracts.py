@@ -1,0 +1,203 @@
+from uuid import uuid4
+
+import pytest
+
+from src.config import settings
+from src.agent.loop import run_turn
+from src.schemas import (
+    AncestorMutationWarningResponse, BranchResponse, ChatResponse,
+    MessageResponse, RegenerateReplyResponse, ToggleActiveResponse,
+)
+from tests.conftest import append_api_message, create_api_chat
+
+pytestmark = pytest.mark.asyncio
+
+
+async def test_create_and_list_chats(api_client):
+    chat, _ = await create_api_chat(api_client)
+    response = await api_client.get("/api/v1/chats")
+    assert response.status_code == 200
+    assert [ChatResponse.model_validate(row) for row in response.json()] == [chat]
+
+
+@pytest.mark.parametrize("name", ["bad name", "/side", "side/", "side//child"])
+async def test_invalid_branch_name(api_client, name):
+    chat, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    response = await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": name, "target_message_id": first.id,
+    })
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("content", ["", "  "])
+async def test_blank_message(api_client, api_gemini, content):
+    _, main = await create_api_chat(api_client)
+    response = await api_client.post(f"/api/v1/branches/{main.id}/messages", json={"content": content})
+    assert response.status_code == 422
+    api_gemini.generate_step.assert_not_awaited()
+
+
+async def test_missing_and_duplicate_branch_targets(api_client):
+    chat, main = await create_api_chat(api_client)
+    url = f"/api/v1/chats/{chat.id}/branches"
+    body = {"name": "feature/refactor", "target_message_id": str(uuid4())}
+    assert (await api_client.post(url, json=body)).status_code == 404
+    first = await append_api_message(api_client, main.id, "Question")
+    body["target_message_id"] = first.id
+    created = await api_client.post(url, json=body)
+    assert created.status_code == 201
+    assert BranchResponse.model_validate(created.json()).name == body["name"]
+    assert (await api_client.post(url, json=body)).status_code == 409
+
+
+async def test_edit_warning_force_and_mask(api_client):
+    chat, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    assert (await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": "side", "target_message_id": first.id,
+    })).status_code == 201
+    url = f"/api/v1/messages/{first.id}"
+    warning = await api_client.patch(url, json={"content": "Edited"})
+    assert warning.status_code == 409
+    assert AncestorMutationWarningResponse.model_validate(warning.json()).affected_branch_count == 2
+    edited = await api_client.patch(url, json={"content": "Edited", "force": True})
+    assert edited.status_code == 200
+    dto = MessageResponse.model_validate(edited.json())
+    assert dto.is_edited and dto.content == "Edited"
+    masked = await api_client.post(f"{url}/toggle-active")
+    assert masked.status_code == 200
+    assert ToggleActiveResponse.model_validate(masked.json()).is_active is False
+    assert (await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json() == []
+
+
+async def test_merge_empty_delta(api_client, api_gemini):
+    chat, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    created = await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": "side", "target_message_id": first.id,
+    })
+    assert created.status_code == 201
+    assert (await api_client.post(f"/api/v1/branches/{created.json()['id']}/merge", json={})).status_code == 400
+    api_gemini.summarize_delta.assert_not_awaited()
+
+
+async def test_run_rejects_stale_head(api_client, api_gemini):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    response = await api_client.post(f"/api/v1/branches/{main.id}/run", json={"expected_head_id": str(uuid4())})
+    assert response.status_code == 409
+    api_gemini.generate_step.assert_not_awaited()
+    history = await api_client.get(f"/api/v1/branches/{main.id}/timeline")
+    assert [item["id"] for item in history.json()] == [first.id]
+
+
+async def test_run_rechecks_head_after_service_validation(api_client, api_gemini, monkeypatch):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+
+    async def concurrent_append(*args, **kwargs):
+        await append_api_message(api_client, main.id, "New question")
+        return await run_turn(*args, **kwargs)
+
+    monkeypatch.setattr("src.services.run_turn", concurrent_append)
+    response = await api_client.post(f"/api/v1/branches/{main.id}/run", json={
+        "expected_head_id": first.id,
+    })
+    assert response.status_code == 409
+    api_gemini.generate_step.assert_not_awaited()
+
+
+async def test_missing_chat_branch_and_message(api_client):
+    missing = uuid4()
+    for url in (f"/chats/{missing}/branches", f"/branches/{missing}/timeline"):
+        response = await api_client.get(f"/api/v1{url}")
+        assert response.status_code == 404
+        assert response.json()["detail"]
+    response = await api_client.patch(f"/api/v1/messages/{missing}", json={"content": "Edit"})
+    assert response.status_code == 404
+
+
+async def test_run_requires_active_user_head(api_client, api_gemini):
+    _, main = await create_api_chat(api_client)
+    run_url = f"/api/v1/branches/{main.id}/run"
+    assert (await api_client.post(run_url, json={})).status_code == 409
+    first = await append_api_message(api_client, main.id, "Question")
+    toggle_url = f"/api/v1/messages/{first.id}/toggle-active"
+    assert (await api_client.post(toggle_url)).status_code == 200
+    assert (await api_client.post(run_url, json={})).status_code == 409
+    api_gemini.generate_step.assert_not_awaited()
+
+
+async def test_lifespan_initializes_sqlite_and_cors(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from src import main
+    from src.storage import database
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    monkeypatch.setattr(main, "engine", engine)
+    monkeypatch.setattr(database, "async_session_factory", async_sessionmaker(
+        engine, expire_on_commit=False, autoflush=False,
+    ))
+    async with main.app.router.lifespan_context(main.app):
+        async with AsyncClient(
+            transport=ASGITransport(app=main.app), base_url="http://test",
+        ) as client:
+            await create_api_chat(client)
+            response = await client.options("/api/v1/chats", headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+            })
+            assert response.status_code == 200
+            assert response.headers["access-control-allow-origin"] == "*"
+
+
+async def test_run_maps_oversize_to_413(api_client, api_gemini, monkeypatch):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", 1)
+    response = await api_client.post(f"/api/v1/branches/{main.id}/run", json={})
+    assert response.status_code == 413
+    api_gemini.generate_step.assert_not_awaited()
+    assert (await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json()[0]["id"] == first.id
+
+
+async def test_regenerate_validates_head_and_preserves_original_branch(api_client):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={})
+    assert run.status_code == 200
+    url = f"/api/v1/branches/{main.id}/regenerate"
+    body = {"new_branch_name": "retry/one"}
+    assert (await api_client.post(url, json=body)).status_code == 422
+    assert (await api_client.post(url, json={**body, "expected_head_id": first.id})).status_code == 409
+    response = await api_client.post(url, json={**body, "expected_head_id": run.json()["id"]})
+    assert response.status_code == 201, response.text
+    dto = RegenerateReplyResponse.model_validate(response.json())
+    assert dto.branch.forked_from_id == first.id
+    assert dto.branch.head_message_id == dto.message.id
+    assert dto.message.parent_id == first.id
+    original = await api_client.get(f"/api/v1/branches/{main.id}/timeline")
+    assert original.json()[-1]["id"] == run.json()["id"]
+
+
+async def test_regenerate_failure_exposes_fork_for_retry(api_client, api_gemini):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "Question")
+    run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={})
+    assert run.status_code == 200
+    api_gemini.generate_step.side_effect = RuntimeError("upstream diagnostic")
+    response = await api_client.post(f"/api/v1/branches/{main.id}/regenerate", json={
+        "new_branch_name": "retry", "expected_head_id": run.json()["id"],
+    })
+    assert response.status_code == 502
+    assert "upstream diagnostic" not in response.text
+    assert response.json()["head_message_id"] == first.id
+    api_gemini.generate_step.side_effect = None
+    retry = await api_client.post(f"/api/v1/branches/{response.json()['branch_id']}/run", json={
+        "expected_head_id": first.id,
+    })
+    assert retry.status_code == 200
+    assert retry.json()["parent_id"] == first.id
