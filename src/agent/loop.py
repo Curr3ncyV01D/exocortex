@@ -131,7 +131,7 @@ async def _run_turn(
     max_iterations: int,
     expected_head_id: str | None,
 ) -> Message:
-    branch = await get_branch(chat_id=chat_id, branch_name=branch_name, session=session)
+    branch = await get_branch(chat_id, branch_name, session, refresh=True)
     if not branch:
         raise BranchNotFoundError(
             f"Ветка '{branch_name}' не найдена в чате {chat_id}"

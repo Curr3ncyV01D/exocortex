@@ -1,12 +1,12 @@
-import enum
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Enum,
+    Enum as SQLEnum,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -21,13 +21,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.storage.database import Base
 
 
-class MessageRole(str, enum.Enum):
+class MessageRole(str, Enum):
     USER = "user"
     MODEL = "model"
     SYSTEM_MERGE = "system_merge"
 
 
-class BranchStatus(str, enum.Enum):
+class BranchStatus(str, Enum):
     ACTIVE = "active"
     MERGED = "merged"
     ARCHIVED = "archived"
@@ -109,7 +109,7 @@ class Branch(Base):
         nullable=True,
     )
     status: Mapped[BranchStatus] = mapped_column(
-        Enum(BranchStatus),
+        SQLEnum(BranchStatus),
         default=BranchStatus.ACTIVE,
         nullable=False,
     )
@@ -154,7 +154,7 @@ class Message(Base):
         nullable=True,
     )
     role: Mapped[MessageRole] = mapped_column(
-        Enum(MessageRole),
+        SQLEnum(MessageRole),
         nullable=False,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)

@@ -69,7 +69,22 @@ class GeminiClient:
         model_name: Optional[str] = None,
     ) -> None:
         self._model_name = settings.GEMINI_MODEL if model_name is None else model_name
-        self._client = genai.Client(api_key=api_key)
+        self._api_key = api_key
+        self._sdk_client: genai.Client | None = None
+
+    @property
+    def _client(self) -> genai.Client:
+        if self._sdk_client is None:
+            self._sdk_client = genai.Client(api_key=self._api_key)
+        return self._sdk_client
+
+    async def aclose(self) -> None:
+        if self._sdk_client is not None:
+            try:
+                await self._sdk_client.aio.aclose()
+            finally:
+                self._sdk_client.close()
+                self._sdk_client = None
 
     async def generate_step(
         self,

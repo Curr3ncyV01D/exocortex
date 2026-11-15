@@ -69,9 +69,12 @@ class MergeResult(TypedDict):
     summary: str
 
 
-async def get_branch(chat_id: str, branch_name: str, session: AsyncSession) -> Optional[Branch]:
+async def get_branch(
+    chat_id: str, branch_name: str, session: AsyncSession, *, refresh: bool = False,
+) -> Optional[Branch]:
+    statement = select(Branch).where(Branch.chat_id == chat_id, Branch.name == branch_name)
     return await session.scalar(
-        select(Branch).where(Branch.chat_id == chat_id, Branch.name == branch_name)
+        statement.execution_options(populate_existing=refresh)
     )
 
 

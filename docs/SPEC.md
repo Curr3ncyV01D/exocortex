@@ -519,6 +519,8 @@ sequenceDiagram
 
 ## 5. Контракты API и Pydantic-схемы (REST Interface)
 
+См. [архитектуру транспорта](explanation/transport.md) и [проверку живого ответа через Swagger](how-to/test-gemini-with-swagger.md). Интерактивная схема доступна по `/docs`, а OpenAPI JSON — по `/openapi.json` запущенного приложения.
+
 Интерфейс системы строится на базе **FastAPI**. Взаимодействие осуществляется через стандартный синхронный протокол JSON REST API без накладных расходов на потоковую передачу данных (Non-streaming). Все эндпоинты сгруппированы под базовым префиксом `/api/v1`.
 
 ```mermaid
@@ -540,7 +542,7 @@ flowchart LR
 
 ### 5.1. Базовые Pydantic-схемы (Data Transfer Objects)
 
-Схемы валидации запросов и сериализации ответов (`src/schemas.py`).
+Схемы валидации запросов и сериализации ответов находятся в [`src/schemas.py`](../src/schemas.py). DTO ответов поддерживают чтение атрибутов ORM через `ConfigDict(from_attributes=True)`. Временные метки сериализуются в UTC. При сериализации сообщения поле `metadata_json` читается как JSON-объект и возвращается под именем `metadata`. Запись и правка реплики отклоняют строки, состоящие только из пробелов, и сохраняют форматирование непустого текста.
 
 ```python
 from datetime import datetime
@@ -553,6 +555,11 @@ class RoleEnum(str, Enum):
     USER = "user"
     MODEL = "model"
     SYSTEM_MERGE = "system_merge"
+
+class BranchStatusEnum(str, Enum):
+    ACTIVE = "active"
+    MERGED = "merged"
+    ARCHIVED = "archived"
 
 # --- Схемы чатов ---
 class ChatCreateRequest(BaseModel):
@@ -576,16 +583,17 @@ class BranchResponse(BaseModel):
     head_message_id: Optional[str]
     forked_from_id: Optional[str]
     last_merged_message_id: Optional[str]
+    status: BranchStatusEnum
     created_at: datetime
 
 class BranchMergeRequest(BaseModel):
     target_branch: Literal["main"] = "main"
 
 class BranchMergeResponse(BaseModel):
-    status: str = "success"
+    status: Literal["success"] = "success"
     merge_message_id: str
     source_branch: str
-    target_branch: str
+    target_branch: Literal["main"]
     compressed_messages_count: int
     summary: str
 
@@ -602,11 +610,11 @@ class MessageResponse(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime]
 
-class MessageCreateRequest(BaseModel):
+class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Текст пользовательского промпта")
 
-class GenerateReplyRequest(BaseModel):
-    expected_head_id: UUID
+class RunTurnRequest(BaseModel):
+    expected_head_id: Optional[str] = None
 
 class RegenerateReplyRequest(BaseModel):
     expected_head_id: UUID
@@ -629,7 +637,7 @@ class ToggleActiveResponse(BaseModel):
 
 # --- Схема ошибки предка (409 Conflict) ---
 class AncestorMutationWarningResponse(BaseModel):
-    detail: str = "ANCESTOR_MUTATION_WARNING"
+    detail: Literal["ANCESTOR_MUTATION_WARNING"] = "ANCESTOR_MUTATION_WARNING"
     affected_branch_count: int
     message: str
 ```
@@ -638,13 +646,15 @@ class AncestorMutationWarningResponse(BaseModel):
 
 ### 5.2. Спецификация REST-эндпоинтов
 
-Маршруты описывают будущий транспорт FastAPI. Для генерации ожидаемая вершина должна быть активным сообщением пользователя. Для перегенерации ожидаемая вершина должна быть репликой модели с родительским сообщением пользователя. При сбое Gemini новая ветка уже сохранена и доступна для повторной генерации. Ответ об ошибке включает идентификаторы созданной ветки и её вершины.
+Маршруты реализованы в `src/api/routes`. Для генерации вершина должна быть активным сообщением пользователя. Для перегенерации вершина должна быть репликой модели с активным родительским сообщением пользователя. При сбое Gemini новая ветка уже сохранена и доступна для повторной генерации. Ответ `413` или `502` после создания форка включает поля `detail`, `branch_id` и `head_message_id`.
 
-Маршруты адресуют ветку по `branch_id` (UUID). Имя ветки передаётся в теле запроса и может содержать `/`, например `feature/refactor`.
+Маршруты адресуют ветку по строковому `branch_id` (UUID). В имени ветки слэш разделяет непустые сегменты, например `feature/refactor`. Ведущие, хвостовые и двойные слэши отклоняются.
 
-`/run` передаёт обязательное поле `expected_head_id` в `run_turn()`. При несовпадении исходной вершины ядро возвращает `BranchConflictError` до вызова Gemini. При записи ответа ядро повторно проверяет вершину. Оба конфликта соответствуют HTTP `409`. В `/regenerate` транспорт проверяет исходную вершину в той же транзакции, в которой создаёт форк.
+`/run` передаёт необязательное поле `expected_head_id` в `run_turn()`. Если клиент передал ID, несовпадение исходной вершины приводит к `BranchConflictError` до вызова Gemini. Если поле пропущено или равно `null`, ход начинается с актуальной вершины. При записи ответа ядро всегда проверяет, что вершина соответствует началу хода. Оба конфликта соответствуют HTTP `409`. В `/regenerate` ожидаемая вершина обязательна, а транспорт проверяет её в той же транзакции, в которой создаёт форк.
 
 Превышение бюджета накопленной истории обрабатывается [скользящим окном](agent_core.md#33-скользящее-окно-контекста). Если последняя активная реплика сама превышает `MAX_CONTEXT_BYTES`, транспорт возвращает `413 Payload Too Large` с предложением разбить реплику или увеличить лимит. Сохранённый текст остаётся целым.
+
+Доменные ошибки возвращаются в JSON с полем `detail`. Предупреждение при редактировании общей реплики использует `AncestorMutationWarningResponse`. Ошибка валидации запроса возвращает `422` со списком нарушений в `detail`. При нарушении целостности графа сервер возвращает `500` с общим сообщением.
 
 #### 5.2.1. Управление пространствами (Chats)
 
@@ -659,9 +669,9 @@ class AncestorMutationWarningResponse(BaseModel):
 
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/chats/{chat_id}/branches` | *None* | `200 OK` -> `list[BranchResponse]` | Возвращает список всех существующих веток чата. |
+| `GET` | `/api/v1/chats/{chat_id}/branches` | *None* | `200 OK` -> `list[BranchResponse]`<br>`404 Not Found` (чат не найден) | Возвращает список всех существующих веток чата. |
 | `POST` | `/api/v1/chats/{chat_id}/branches` | `BranchCreateRequest` | `201 Created` -> `BranchResponse`<br>`404 Not Found` (узел не найден)<br>`409 Conflict` (имя занято) | Атомарное ветвление (`Branch from here`). Форк от сообщения. |
-| `POST` | `/api/v1/chats/{chat_id}/branches/{branch_id}/merge` | `BranchMergeRequest` | `200 OK` -> `BranchMergeResponse`<br>`400 Bad Request` (недопустимое слияние или нет активной дельты)<br>`404 Not Found` (ветка не найдена) | Инкрементальное сквош-слияние побочной ветки в `main`. |
+| `POST` | `/api/v1/branches/{branch_id}/merge` | `BranchMergeRequest` | `200 OK` -> `BranchMergeResponse`<br>`400 Bad Request` (недопустимое слияние или нет активной дельты)<br>`404 Not Found` (ветка не найдена)<br>`409 Conflict` (ветка изменилась во время слияния)<br>`502 Bad Gateway` (сбой Gemini при суммаризации) | Инкрементальное сквош-слияние побочной ветки в `main`. |
 
 ---
 
@@ -669,9 +679,11 @@ class AncestorMutationWarningResponse(BaseModel):
 
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/chats/{chat_id}/branches/{branch_id}/timeline` | *None* | `200 OK` -> `list[MessageResponse]` | Реконструирует цепочку активных сообщений ветки (Алгоритм 3.1). |
-| `POST` | `/api/v1/branches/{branch_id}/messages` | `MessageCreateRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя без запуска Gemini. Несколько таких запросов образуют цепочку. |
-| `POST` | `/api/v1/branches/{branch_id}/run` | `GenerateReplyRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (вершина изменилась, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на уже сохранённый вопрос с проверкой `expected_head_id`. После сбоя тот же запрос может повторить генерацию, пока вершина не изменилась. |
+| `GET` | `/api/v1/branches/{branch_id}/timeline` | *None* | `200 OK` -> `list[MessageResponse]` | Реконструирует цепочку активных сообщений ветки (Алгоритм 3.1). |
+| `POST` | `/api/v1/branches/{branch_id}/messages` | `SendMessageRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя без запуска Gemini. Несколько таких запросов образуют цепочку. |
+| `POST` | `/api/v1/branches/{branch_id}/run` | `RunTurnRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (вершина изменилась, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на уже сохранённый вопрос. Клиент может передать `expected_head_id`, чтобы повторять генерацию только для той же вершины. |
 | `POST` | `/api/v1/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки или нет ответа для перегенерации)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Автоматически создаёт форк от родителя текущего ответа модели и запускает генерацию в новой ветке. Исходный ответ остаётся в исходной ветке. |
 | `PATCH` | `/api/v1/messages/{message_id}` | `MessageUpdateContentRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` -> `AncestorMutationWarningResponse` | In-place правка текста (Алгоритм 3.3). Требует `force=True` для предков. |
 | `POST` | `/api/v1/messages/{message_id}/toggle-active` | *None* | `200 OK` -> `ToggleActiveResponse` | Контекстное маскирование (Алгоритм 3.5). Инвертирует флаг `is_active`. |
+
+Операции над отдельной веткой и сообщением возвращают `404`, если указанный объект отсутствует. Добавление реплики также может вернуть `409`, если конкурентная запись изменила вершину.
