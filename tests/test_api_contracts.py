@@ -9,6 +9,8 @@ from src.schemas import (
     AncestorMutationWarningResponse, BranchResponse, ChatResponse,
     MessageResponse, RegenerateReplyResponse, ToggleActiveResponse,
 )
+from src.storage.crud.chats import append_message
+from src.storage.models import MessageRole
 from tests.conftest import append_api_message, create_api_chat
 
 pytestmark = pytest.mark.asyncio
@@ -213,6 +215,76 @@ async def test_run_requires_active_user_head(api_client, api_gemini):
     api_gemini.generate_step.assert_not_awaited()
 
 
+async def test_run_checks_active_question_separately_from_head(api_client: AsyncClient, api_gemini) -> None:
+    """Пропустить скрытую вершину, сохранив её в цепочке и проверке записи."""
+    _, main = await create_api_chat(api_client)
+    question = await append_api_message(api_client, main.id, "Question")
+    hidden = await append_api_message(api_client, main.id, "Hidden head")
+    branch_url = f"/api/v1/branches/{main.id}"
+    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+    run = await api_client.post(f"{branch_url}/run", json={
+        "expected_head_id": hidden.id, "expected_question_id": hidden.id,
+    })
+    assert run.status_code == 409
+    api_gemini.generate_step.assert_not_awaited()
+
+    run = await api_client.post(f"{branch_url}/run", json={
+        "expected_head_id": hidden.id, "expected_question_id": question.id,
+    })
+    assert run.status_code == 200, run.text
+    answer = MessageResponse.model_validate(run.json())
+    assert answer.parent_id == hidden.id
+    assert answer.metadata["reply_to_message_id"] == question.id
+    assert (await api_client.post(f"{branch_url}/run", json={})).status_code == 409
+
+    # Hiding the recorded question must not redirect regeneration to another ancestor.
+    assert (await api_client.post(f"/api/v1/messages/{question.id}/toggle-active")).status_code == 200
+    response = await api_client.post(f"{branch_url}/regenerate", json={
+        "expected_head_id": answer.id, "new_branch_name": "retry",
+    })
+    assert response.status_code == 409
+    assert "Верните" in response.json()["detail"]
+    assert (await api_client.post(f"/api/v1/messages/{question.id}/toggle-active")).status_code == 200
+    suffix = await append_api_message(api_client, main.id, "Hidden suffix")
+    assert (await api_client.post(f"/api/v1/messages/{suffix.id}/toggle-active")).status_code == 200
+    response = await api_client.post(f"{branch_url}/regenerate", json={
+        "expected_head_id": suffix.id, "new_branch_name": "retry",
+    })
+    assert response.status_code == 201, response.text
+    result = RegenerateReplyResponse.model_validate(response.json())
+    assert result.branch.forked_from_id == question.id
+
+
+@pytest.mark.parametrize("summary_fits", [True, False])
+async def test_run_keeps_pending_question_after_merge(api_client, api_gemini, monkeypatch, summary_fits):
+    """Сохранить вопрос в окне, даже если более новая выжимка превышает бюджет."""
+    chat, main = await create_api_chat(api_client)
+    question = await append_api_message(api_client, main.id, "Pending question")
+    fork = await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": "side", "target_message_id": question.id,
+    })
+    assert fork.status_code == 201
+    side = BranchResponse.model_validate(fork.json())
+    await append_api_message(api_client, side.id, "Side delta")
+    summary = "Merge summary" if summary_fits else "Merge summary " * 200
+    api_gemini.summarize_delta.return_value = summary
+    merge = await api_client.post(f"/api/v1/branches/{side.id}/merge", json={})
+    assert merge.status_code == 200, merge.text
+    hidden = await append_api_message(api_client, main.id, "Masked after merge")
+    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+    monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", 1200)
+    run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={
+        "expected_head_id": hidden.id, "expected_question_id": question.id,
+    })
+    assert run.status_code == 200, run.text
+    assert run.json()["parent_id"] == hidden.id
+    contents = api_gemini.generate_step.await_args.kwargs["contents"]
+    sent = " ".join(part.text for content in contents for part in content.parts)
+    assert question.content in sent
+    assert ("Merge summary" in sent) is summary_fits
+    assert hidden.content not in sent
+
+
 async def test_lifespan_initializes_sqlite_and_cors(monkeypatch):
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -265,6 +337,20 @@ async def test_regenerate_validates_head_and_preserves_original_branch(api_clien
     assert dto.message.parent_id == first.id
     original = await api_client.get(f"/api/v1/branches/{main.id}/timeline")
     assert original.json()[-1]["id"] == run.json()["id"]
+
+
+async def test_regenerate_uses_direct_parent_for_legacy_answer(api_client, file_sessions):
+    chat, main = await create_api_chat(api_client)
+    question = await append_api_message(api_client, main.id, "Legacy question")
+    async with file_sessions.begin() as session:
+        answer = await append_message(chat.id, main.name, MessageRole.MODEL, "Legacy answer", session)
+        answer_id = answer.id
+
+    response = await api_client.post(f"/api/v1/branches/{main.id}/regenerate", json={
+        "expected_head_id": answer_id, "new_branch_name": "retry/legacy",
+    })
+    assert response.status_code == 201, response.text
+    assert response.json()["branch"]["forked_from_id"] == question.id
 
 
 async def test_regenerate_failure_exposes_fork_for_retry(

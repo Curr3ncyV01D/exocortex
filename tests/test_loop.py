@@ -14,7 +14,10 @@ from src.agent.client import GeminiClient, map_messages_to_gemini
 from src.agent.loop import BranchBusyError, LLMGenerationError, PromptTooLargeError, run_turn
 from src.config import settings
 from src.storage.crud.chats import append_message
-from src.storage.crud.graph import BranchConflictError, branch_from_here, squash_merge_branch
+from src.storage.crud.graph import (
+    BranchConflictError, branch_from_here, squash_merge_branch,
+    toggle_message_active, update_message_content,
+)
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
 
@@ -124,6 +127,39 @@ async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_f
 
 def _contents_size(contents: list[types.Content]) -> int:
     return sum(len(item.model_dump_json().encode("utf-8")) for item in contents)
+
+
+@pytest.mark.asyncio
+async def test_turn_keeps_a_snapshot_for_context_and_memory_tools(file_sessions):
+    """Правка и маска между вызовами Gemini не меняют уже начатый ход."""
+    async with file_sessions() as writer:
+        setup = await create_initial_chat(writer)
+        chat_id, question_id = setup["chat_id"], setup["root_message_id"]
+        await branch_from_here(chat_id, question_id, "side", writer)
+        archive = await append_message(chat_id, "side", MessageRole.USER, "ArchiveMarker", writer)
+        archive_id = archive.id
+        await writer.commit()
+
+    requests = []
+
+    async def generate(*, contents, tools):
+        requests.append([item.model_copy(deep=True) for item in contents])
+        if len(requests) == 1:
+            async with file_sessions.begin() as writer:
+                await update_message_content(question_id, "Edited later", force=True, session=writer)
+                await toggle_message_active(archive_id, writer)
+            return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
+        return _make_text_response("Reply")
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=generate)
+        async with file_sessions() as session:
+            await run_turn(chat_id, "main", client, session, expected_question_id=question_id)
+
+    assert all("Edited later" not in item.model_dump_json() for item in requests[1])
+    result = requests[1][-1].parts[0].function_response
+    assert "ArchiveMarker" in result.response["result"]
 
 
 @pytest.mark.asyncio
@@ -310,7 +346,8 @@ async def test_run_turn_excludes_every_context_node_from_search(
     chat_id = initial_chat_setup["chat_id"]
     first = await append_message(chat_id, "main", MessageRole.MODEL, "Archive first", session)
     second = await append_message(chat_id, "main", MessageRole.MODEL, "Archive second", session)
-    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id]
+    pending = await append_message(chat_id, "main", MessageRole.USER, "Pending question", session)
+    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id, pending.id]
     await session.commit()
 
     with patch("src.agent.client.genai.Client"), patch(

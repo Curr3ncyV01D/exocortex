@@ -92,6 +92,7 @@ class SendMessageRequest(BaseModel):
 
 class RunTurnRequest(BaseModel):
     expected_head_id: str | None = None
+    expected_question_id: str | None = None
 
 
 class MessageUpdateContentRequest(SendMessageRequest):

@@ -57,7 +57,9 @@ async def merge_branch(
     responses={code: {"model": ErrorResponse} for code in (409, 413, 502)},
 )
 async def run_branch(branch_id: str, payload: RunTurnRequest, session: SessionDep, client: GeminiDep):
-    return await services.generate_reply(session, client, branch_id, payload.expected_head_id)
+    return await services.generate_reply(
+        session, client, branch_id, payload.expected_head_id, payload.expected_question_id,
+    )
 
 
 @router.post(

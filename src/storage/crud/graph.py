@@ -135,6 +135,13 @@ async def read_context_from_head(
     return [msg for msg in reversed(history) if include_inactive or msg.is_active]
 
 
+def latest_dialogue_message(history: list[Message]) -> Message | None:
+    return next(
+        (msg for msg in reversed(history) if msg.is_active and msg.role in (MessageRole.USER, MessageRole.MODEL)),
+        None,
+    )
+
+
 async def _read_history(
     chat_id: str,
     head_id: str | None,
