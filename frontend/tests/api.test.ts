@@ -42,10 +42,12 @@ describe('REST API client', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     expect(await api.sendMessage(main.id, saved.content)).toEqual(saved)
-    expect(await api.runTurn(main.id, saved.id)).toEqual(timeline[1])
+    expect(await api.runTurn(main.id, { headId: 'structural-head', questionId: saved.id })).toEqual(timeline[1])
     expect(fetchMock.mock.calls.map(([url, options]) => [url, options.method, JSON.parse(options.body)])).toEqual([
       ['/api/v1/branches/branch-main/messages', 'POST', { content: saved.content }],
-      ['/api/v1/branches/branch-main/run', 'POST', { expected_head_id: saved.id }],
+      ['/api/v1/branches/branch-main/run', 'POST', {
+        expected_head_id: 'structural-head', expected_question_id: saved.id,
+      }],
     ])
   })
 

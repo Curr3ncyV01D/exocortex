@@ -18,6 +18,10 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
   const scrollArea = useRef<HTMLDivElement>(null)
   const head = timeline.status === 'ready' ? timeline.data.at(-1) : undefined
   const headId = head?.id
+  const dialogue = timeline.status === 'ready'
+    ? timeline.data.findLast((message) => message.is_active && message.role !== 'system_merge')
+    : undefined
+  const target = headId && dialogue?.role === 'user' ? { headId, questionId: dialogue.id } : undefined
 
   useLayoutEffect(() => {
     const area = scrollArea.current
@@ -63,7 +67,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
         </div>
       </div>
       {activeBranchId && (
-        <ChatInput key={activeBranchId} branchId={activeBranchId} head={head} historyReady={timeline.status === 'ready'} />
+        <ChatInput key={activeBranchId} branchId={activeBranchId} target={target} historyReady={timeline.status === 'ready'} />
       )}
     </main>
   )

@@ -1,5 +1,5 @@
 import type {
-  AncestorMutationWarningResponse, BranchResponse, ChatResponse, MessageResponse, ToggleActiveResponse,
+  AncestorMutationWarningResponse, BranchResponse, ChatResponse, MessageResponse, RunTarget, ToggleActiveResponse,
 } from './types'
 
 const apiPrefix = '/api/v1'
@@ -68,8 +68,11 @@ export const api = {
   sendMessage: (branchId: string, content: string) =>
     post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/messages`, { content }),
 
-  runTurn: (branchId: string, expectedHeadId: string) =>
-    post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/run`, { expected_head_id: expectedHeadId }),
+  runTurn: (branchId: string, target: RunTarget) =>
+    post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/run`, {
+      expected_head_id: target.headId,
+      expected_question_id: target.questionId,
+    }),
 
   editMessage: (messageId: string, content: string, force: boolean) =>
     jsonRequest<MessageResponse>(`/messages/${encodeURIComponent(messageId)}`, 'PATCH', { content, force }),

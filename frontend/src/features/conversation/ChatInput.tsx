@@ -1,18 +1,18 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react'
-import type { MessageResponse } from '../../api/types'
+import type { RunTarget } from '../../api/types'
 import { useWorkspace } from '../../store/workspace'
 import { clearSentDraft, onDraftCleared, readDraft, writeDraft } from './drafts'
 
 interface ChatInputProps {
   branchId: string
-  head?: MessageResponse
+  target?: RunTarget
   historyReady: boolean
 }
 
 const minInputHeight = 48
 const maxInputHeight = () => Math.max(minInputHeight, Math.floor(window.innerHeight * 0.4))
 
-export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
+export function ChatInput({ branchId, target, historyReady }: ChatInputProps) {
   const [draft, setDraft] = useState(() => readDraft(branchId))
   const [height, setHeight] = useState<number>()
   const [dragging, setDragging] = useState(false)
@@ -24,10 +24,12 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
   const runBranch = useWorkspace((state) => state.runBranch)
   const busy = turn?.status === 'saving' || turn?.status === 'generating'
   const hasDraft = draft.trim().length > 0
-  const headId = head?.role === 'user' && head.is_active ? head.id : undefined
   const canAdd = historyReady && !busy && hasDraft
-  const canRun = historyReady && !busy && (hasDraft || headId !== undefined)
-  const retryHead = turn?.status === 'error' && turn.retryHeadId === headId ? headId : undefined
+  const oversized = turn?.status === 'error' && turn.oversizedQuestionId === target?.questionId && !!target
+  const canRun = historyReady && !busy && (hasDraft || (target !== undefined && !oversized))
+  const retryTarget = turn?.status === 'error' ? turn.retryTarget : undefined
+  const canRetry = historyReady && retryTarget
+    && retryTarget.headId === target?.headId && retryTarget.questionId === target?.questionId
 
   useLayoutEffect(() => onDraftCleared(branchId, (sentText) => {
     setDraft((current) => current === sentText ? '' : current)
@@ -35,8 +37,8 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
 
   async function submit(generate: boolean) {
     if (generate ? !canRun : !canAdd) return
-    if (!hasDraft && headId) {
-      await runBranch(branchId, headId)
+    if (!hasDraft && target) {
+      await runBranch(branchId, target)
       return
     }
     if (await sendMessage(branchId, draft, generate)) clearSentDraft(branchId, draft)
@@ -123,8 +125,8 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
         {turn?.status === 'error' && (
           <div className="mb-2 flex flex-wrap items-center gap-2 px-1 text-sm">
             <p role="alert" className="text-rose-200">{turn.message}</p>
-            {retryHead && historyReady && (
-              <button type="button" className="button-secondary" onClick={() => void runBranch(branchId, retryHead)}>
+            {canRetry && (
+              <button type="button" className="button-secondary" onClick={() => void runBranch(branchId, retryTarget)}>
                 Повторить генерацию
               </button>
             )}
@@ -134,7 +136,9 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
           <div className="min-w-0 flex-1 px-1 text-xs text-muted" role="status">
             {turn?.status === 'saving' && 'Сохраняем сообщение…'}
             {turn?.status === 'generating' && 'Gemini отвечает…'}
-            {!turn && !hasDraft && headId && 'Есть сохранённый вопрос'}
+            {historyReady && !busy && !hasDraft && !oversized && (
+              target ? 'Run ответит на сохранённый вопрос' : 'Введите новое сообщение'
+            )}
           </div>
           <div className="ml-auto flex items-center gap-2">
             <button type="button" className="button-secondary" disabled={!canAdd} onClick={() => void submit(false)}>
@@ -145,7 +149,7 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
               className="button-primary"
               disabled={!canRun}
               aria-keyshortcuts="Control+Enter"
-              title={!hasDraft && headId ? 'Ответить на сохранённый вопрос' : 'Отправить сообщение и получить ответ'}
+              title={!hasDraft && target ? 'Ответить на сохранённый вопрос' : 'Отправить сообщение и получить ответ'}
             >
               Run <kbd aria-hidden="true" className="hidden text-xs opacity-75 sm:inline">Ctrl+Enter</kbd>
             </button>

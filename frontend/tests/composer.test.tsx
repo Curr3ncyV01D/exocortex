@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import App from '../src/App'
@@ -12,15 +12,28 @@ interface Post {
 }
 
 function mockConversation(overrides: {
+  history?: MessageResponse[]
   send?: (request: Post) => Response | undefined | Promise<Response | undefined>
   run?: (request: Post, history: MessageResponse[]) => Response | undefined | Promise<Response | undefined>
 } = {}) {
-  const histories: Record<string, MessageResponse[]> = { [main.id]: [], [side.id]: [] }
+  const histories: Record<string, MessageResponse[]> = { [main.id]: [...(overrides.history ?? [])], [side.id]: [] }
   const posts: Post[] = []
   const fetchMock = vi.fn(async (url: string, options: RequestInit) => {
     const path = new URL(url, 'http://test').pathname
     if (path === '/api/v1/chats') return Response.json([chat])
     if (path === `/api/v1/chats/${chat.id}/branches`) return Response.json([main, side])
+    const [, messageId] = path.match(/\/messages\/([^/]+)(?:\/toggle-active)?$/) ?? []
+    if (messageId) {
+      const message = histories[main.id].find(({ id }) => id === messageId)
+      if (!message) throw new Error(`Unknown message: ${messageId}`)
+      if (options.method === 'PATCH') {
+        message.content = (JSON.parse(String(options.body)) as { content: string }).content
+        message.is_edited = true
+        return Response.json(message)
+      }
+      message.is_active = !message.is_active
+      return Response.json({ message_id: messageId, is_active: message.is_active })
+    }
     const [, branchId, action] = path.match(/\/branches\/([^/]+)\/(timeline|messages|run)$/) ?? []
     if (!branchId) throw new Error(`Unexpected request: ${url}`)
 
@@ -85,7 +98,9 @@ it('saves the full prompt and uses its id for Ctrl+Enter generation', async () =
   expect(composer).toHaveValue('')
   expect(posts).toEqual([
     { branchId: main.id, action: 'messages', body: { content: '  Сохрани отступы  ' } },
-    { branchId: main.id, action: 'run', body: { expected_head_id: 'branch-main-1' } },
+    { branchId: main.id, action: 'run', body: {
+      expected_head_id: 'branch-main-1', expected_question_id: 'branch-main-1',
+    } },
   ])
 })
 
@@ -104,7 +119,9 @@ it('adds user messages without generation and runs the newest one on demand', as
   expect(posts.map(({ action }) => action)).toEqual(['messages', 'messages'])
   await user.click(screen.getByRole('button', { name: 'Run' }))
   expect(await screen.findByText('Ответ для branch-main')).toBeVisible()
-  expect(posts.at(-1)).toEqual({ branchId: main.id, action: 'run', body: { expected_head_id: 'branch-main-2' } })
+  expect(posts.at(-1)).toEqual({ branchId: main.id, action: 'run', body: {
+    expected_head_id: 'branch-main-2', expected_question_id: 'branch-main-2',
+  } })
 })
 
 it('restores individual drafts when switching branches and reloading', async () => {
@@ -229,4 +246,69 @@ it('preserves a newer draft when a previous save finishes in the same branch', a
   render(<App />)
   await screen.findByText('Первый текст')
   expect(input()).toHaveValue('Новый черновик')
+})
+
+function savedQuestion(id: string, content: string, isActive: boolean): MessageResponse {
+  return {
+    id, content, chat_id: chat.id, role: 'user', parent_id: null, is_active: isActive,
+    is_edited: false, metadata: null, created_at: chat.created_at, updated_at: null,
+  }
+}
+
+/** A mask can change the selected question without changing the branch head. */
+it('runs past a summary and hidden head, then invalidates retry when the question changes', async () => {
+  const history: MessageResponse[] = [
+    savedQuestion('first', 'Первый вопрос', true),
+    savedQuestion('second', 'Второй вопрос', true),
+    { ...savedQuestion('summary', 'Выжимка', true), role: 'system_merge' },
+    savedQuestion('hidden', 'Скрытая вершина', false),
+  ]
+  const run = vi.fn()
+    .mockReturnValueOnce(Response.json({ detail: 'Ошибка Gemini.' }, { status: 502 }))
+    .mockReturnValueOnce(undefined)
+  const { posts } = mockConversation({ history, run })
+  const user = userEvent.setup()
+  render(<App />)
+
+  expect(await screen.findByText('Run ответит на сохранённый вопрос')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Run' }))
+  expect(await screen.findByRole('button', { name: 'Повторить генерацию' })).toBeVisible()
+  const row = within(screen.getByText('Второй вопрос').closest('li') as HTMLElement)
+  await user.click(row.getByRole('button', { name: 'Действия с сообщением' }))
+  await user.click(row.getByRole('button', { name: 'Скрыть из контекста' }))
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Повторить генерацию' })).not.toBeInTheDocument())
+  expect(posts).toHaveLength(1)
+
+  await user.click(screen.getByRole('button', { name: 'Run' }))
+  expect(await screen.findByText('Ответ для branch-main')).toBeVisible()
+  expect(posts.map(({ body }) => body)).toEqual([
+    { expected_head_id: 'hidden', expected_question_id: 'second' },
+    { expected_head_id: 'hidden', expected_question_id: 'first' },
+  ])
+  expect(screen.getByText('Введите новое сообщение')).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Run' })).toBeDisabled()
+})
+
+it('offers to edit a saved oversized question before running it again', async () => {
+  const run = vi.fn()
+    .mockReturnValueOnce(Response.json({ detail: 'Превышен лимит.' }, { status: 413 }))
+    .mockReturnValueOnce(undefined)
+  mockConversation({ history: [savedQuestion('question', 'Слишком длинный вопрос', true)], run })
+  const user = userEvent.setup()
+  render(<App />)
+
+  await screen.findByText('Слишком длинный вопрос')
+  const runButton = screen.getByRole('button', { name: 'Run' })
+  await user.click(runButton)
+  expect(await screen.findByRole('alert')).toHaveTextContent('Сократите его через «Редактировать»')
+  expect(runButton).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Редактировать сообщение' }))
+  const editor = screen.getByRole('textbox', { name: 'Текст сообщения' })
+  editor.focus()
+  await user.keyboard('{Control>}a{/Control}Короткий вопрос')
+  await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+  expect(await screen.findByText('Короткий вопрос')).toBeVisible()
+  expect(runButton).toBeEnabled()
+  await user.click(runButton)
+  expect(await screen.findByText('Ответ для branch-main')).toBeVisible()
 })

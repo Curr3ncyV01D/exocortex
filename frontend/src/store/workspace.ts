@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { api, ApiError, requestErrorMessage } from '../api/client'
-import type { BranchResponse, ChatResponse, MessageResponse } from '../api/types'
+import type { BranchResponse, ChatResponse, MessageResponse, RunTarget } from '../api/types'
 
 type Resource<T> =
   | { status: 'idle' | 'loading' }
@@ -9,7 +9,7 @@ type Resource<T> =
 
 type TurnState =
   | { status: 'saving' | 'generating' }
-  | { status: 'error'; message: string; retryHeadId?: string }
+  | { status: 'error'; message: string; retryTarget?: RunTarget; oversizedQuestionId?: string }
 
 interface WorkspaceData {
   chats: Resource<ChatResponse[]>
@@ -27,7 +27,7 @@ interface WorkspaceState extends WorkspaceData {
   selectBranch: (branchId: string) => Promise<void>
   createChat: (title: string) => Promise<void>
   sendMessage: (branchId: string, content: string, generate: boolean) => Promise<boolean>
-  runBranch: (branchId: string, headId: string) => Promise<void>
+  runBranch: (branchId: string, target: RunTarget) => Promise<void>
   editMessage: (message: MessageResponse, content: string, force: boolean) => Promise<boolean>
   toggleMessage: (message: MessageResponse) => Promise<boolean>
   forkBranch: (sourceBranchId: string, message: MessageResponse, name: string) => Promise<void>
@@ -126,10 +126,10 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     refreshIfSelected(branchId)
   }
 
-  async function generateReply(branchId: string, headId: string, startedAt: number) {
+  async function generateReply(branchId: string, target: RunTarget, startedAt: number) {
     setTurn(branchId, { status: 'generating' })
     try {
-      const reply = await api.runTurn(branchId, headId)
+      const reply = await api.runTurn(branchId, target)
       if (revision !== startedAt) return
       recordMessage(branchId, reply)
       setTurn(branchId)
@@ -138,8 +138,11 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       const status = error instanceof ApiError ? error.status : undefined
       setTurn(branchId, {
         status: 'error',
-        message: requestErrorMessage(error, 'Не удалось получить ответ. Вопрос сохранён.'),
-        retryHeadId: status === 502 || status === undefined ? headId : undefined,
+        message: status === 413
+          ? 'Вопрос сохранён. Сократите его через «Редактировать».'
+          : requestErrorMessage(error, 'Не удалось получить ответ. Вопрос сохранён.'),
+        retryTarget: status === 502 || status === undefined ? target : undefined,
+        oversizedQuestionId: status === 413 ? target.questionId : undefined,
       })
       // Re-read the head if a conflict or an interrupted response left it uncertain.
       if (status === 409 || status === undefined) refreshIfSelected(branchId)
@@ -232,23 +235,29 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       if (revision !== startedAt) return true
 
       recordMessage(branchId, saved)
-      if (generate) void generateReply(branchId, saved.id, startedAt)
+      if (generate) void generateReply(branchId, { headId: saved.id, questionId: saved.id }, startedAt)
       else setTurn(branchId)
       return true
     },
 
-    async runBranch(branchId, headId) {
+    async runBranch(branchId, target) {
       if (branchIsBusy(branchId)) return
-      await generateReply(branchId, headId, revision)
+      await generateReply(branchId, target, revision)
     },
 
-    editMessage(message, content, force) {
-      return mutateMessage(message, async () => {
+    async editMessage(message, content, force) {
+      const saved = await mutateMessage(message, async () => {
         const edited = await api.editMessage(message.id, content, force)
         return (current) => ({
           ...current, content: edited.content, is_edited: edited.is_edited, updated_at: edited.updated_at,
         })
       })
+      if (saved && message.content !== content) {
+        for (const [branchId, turn] of Object.entries(get().turns)) {
+          if (turn?.status === 'error' && turn.oversizedQuestionId === message.id) setTurn(branchId)
+        }
+      }
+      return saved
     },
 
     toggleMessage(message) {

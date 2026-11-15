@@ -34,6 +34,11 @@ export interface ToggleActiveResponse {
   is_active: boolean
 }
 
+export interface RunTarget {
+  headId: string
+  questionId: string
+}
+
 export interface AncestorMutationWarningResponse {
   detail: 'ANCESTOR_MUTATION_WARNING'
   affected_branch_count: number
