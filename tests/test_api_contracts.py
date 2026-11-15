@@ -1,3 +1,4 @@
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -39,6 +40,41 @@ async def test_blank_message(api_client, api_gemini, content):
     response = await api_client.post(f"/api/v1/branches/{main.id}/messages", json={"content": content})
     assert response.status_code == 422
     api_gemini.generate_step.assert_not_awaited()
+
+
+async def test_save_message_replay_survives_lost_response_and_later_edit(api_client: AsyncClient) -> None:
+    """Повтор возвращает прежний ID даже после правки и продвижения вершины."""
+    _, main = await create_api_chat(api_client)
+    path = f"/api/v1/branches/{main.id}/messages"
+    headers = {"Idempotency-Key": str(uuid4())}
+    body = {"content": "Save once"}
+    first = await api_client.post(path, json=body, headers=headers)
+    assert first.status_code == 201
+    saved_id = first.json()["id"]
+    edited = await api_client.patch(f"/api/v1/messages/{saved_id}", json={"content": "Edited"})
+    assert edited.status_code == 200
+    latest = await append_api_message(api_client, main.id, "Another message")
+
+    repeat = await api_client.post(path, json=body, headers=headers)
+    assert repeat.status_code == 201
+    assert repeat.json()["id"] == saved_id
+    assert (await api_client.post(path, json={"content": "Written under another key"}, headers=headers)).status_code == 409
+    history = await api_client.get(f"/api/v1/branches/{main.id}/timeline")
+    assert [(row["id"], row["content"]) for row in history.json()] == [(saved_id, "Edited"), (latest.id, latest.content)]
+
+
+async def test_simultaneous_saves_with_same_key_share_one_message(api_client: AsyncClient) -> None:
+    _, main = await create_api_chat(api_client)
+    path = f"/api/v1/branches/{main.id}/messages"
+    headers = {"Idempotency-Key": str(uuid4())}
+    first, duplicate = await asyncio.gather(*[
+        api_client.post(path, json={"content": "Concurrent save"}, headers=headers)
+        for _ in range(2)
+    ])
+    assert first.status_code == duplicate.status_code == 201
+    assert first.json()["id"] == duplicate.json()["id"]
+    second = await api_client.post(path, json={"content": "Concurrent save"}, headers={"Idempotency-Key": str(uuid4())})
+    assert second.status_code == 201 and second.json()["id"] != first.json()["id"]
 
 
 async def test_missing_and_duplicate_branch_targets(api_client):

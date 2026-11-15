@@ -1,7 +1,7 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react'
 import type { RunTarget } from '../../api/types'
 import { useWorkspace } from '../../store/workspace'
-import { clearSentDraft, onDraftCleared, readDraft, writeDraft } from './drafts'
+import { clearSentDraft, finishSubmission, onDraftCleared, readDraft, startSubmission, writeDraft } from './drafts'
 
 interface ChatInputProps {
   branchId: string
@@ -41,7 +41,11 @@ export function ChatInput({ branchId, target, historyReady }: ChatInputProps) {
       await runBranch(branchId, target)
       return
     }
-    if (await sendMessage(branchId, draft, generate)) clearSentDraft(branchId, draft)
+    const key = startSubmission(branchId, draft)
+    if (await sendMessage(branchId, draft, generate, key)) {
+      clearSentDraft(branchId, draft)
+      finishSubmission(branchId, key)
+    }
   }
 
   function currentHeight() {

@@ -14,10 +14,13 @@ interface Post {
 function mockConversation(overrides: {
   history?: MessageResponse[]
   send?: (request: Post) => Response | undefined | Promise<Response | undefined>
+  loseSaveResponse?: () => boolean
   run?: (request: Post, history: MessageResponse[]) => Response | undefined | Promise<Response | undefined>
 } = {}) {
   const histories: Record<string, MessageResponse[]> = { [main.id]: [...(overrides.history ?? [])], [side.id]: [] }
   const posts: Post[] = []
+  const submissions = new Map<string, MessageResponse>()
+  const saveKeys: (string | null)[] = []
   const fetchMock = vi.fn(async (url: string, options: RequestInit) => {
     const path = new URL(url, 'http://test').pathname
     if (path === '/api/v1/chats') return Response.json([chat])
@@ -41,6 +44,9 @@ function mockConversation(overrides: {
     if (action === 'timeline') return Response.json(history)
     const request = { branchId, action, body: JSON.parse(String(options.body)) as unknown }
     posts.push(request)
+    const key = action === 'messages' ? new Headers(options.headers).get('Idempotency-Key') : null
+    if (action === 'messages') saveKeys.push(key)
+    if (key && submissions.has(key)) return Response.json(submissions.get(key), { status: 201 })
     const override = await (action === 'run' ? overrides.run?.(request, history) : overrides.send?.(request))
     if (override) return override
 
@@ -51,10 +57,12 @@ function mockConversation(overrides: {
       is_active: true, is_edited: false, metadata: null, created_at: chat.created_at, updated_at: null,
     }
     history.push(message)
+    if (key) submissions.set(key, message)
+    if (action === 'messages' && overrides.loseSaveResponse?.()) throw new TypeError('Lost response after commit')
     return Response.json(message, { status: action === 'run' ? 200 : 201 })
   })
   vi.stubGlobal('fetch', fetchMock)
-  return { posts }
+  return { posts, saveKeys }
 }
 
 const input = () => screen.getByRole('textbox', { name: 'Сообщение' })
@@ -176,6 +184,29 @@ it('retains the draft and skips generation when saving fails', async () => {
   app.unmount()
   render(<App />)
   expect(await ready()).toHaveValue('Сохранить черновик')
+})
+
+/** A reload between losing the save response and retrying must preserve the submission key. */
+it('retries a saved message after losing its response without duplicating it', async () => {
+  const loseSaveResponse = vi.fn().mockReturnValueOnce(true).mockReturnValue(false)
+  const { saveKeys, posts } = mockConversation({ loseSaveResponse })
+  const user = userEvent.setup()
+  const app = render(<App />)
+  await focusComposer()
+  await user.keyboard('Сохранённый вопрос')
+  await user.click(screen.getByRole('button', { name: 'Run' }))
+  expect(await screen.findByRole('alert')).toBeVisible()
+  expect(posts.map(({ action }) => action)).toEqual(['messages'])
+
+  app.unmount()
+  render(<App />)
+  await screen.findByText('Сохранённый вопрос', { exact: true })
+  expect(input()).toHaveValue('Сохранённый вопрос')
+  await user.click(screen.getByRole('button', { name: 'Run' }))
+  expect(await screen.findByText('Ответ для branch-main')).toBeVisible()
+  expect(saveKeys[0]).toBeTruthy()
+  expect(saveKeys[1]).toBe(saveKeys[0])
+  expect(screen.getAllByText('Сохранённый вопрос', { exact: true })).toHaveLength(1)
 })
 
 it('refreshes the saved history on a generation conflict without running a different head', async () => {

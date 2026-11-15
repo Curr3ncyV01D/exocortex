@@ -683,7 +683,7 @@ class AncestorMutationWarningResponse(BaseModel):
 | Метод | Эндпоинт | Тело запроса | Ответ (Response) | Описание |
 | :--- | :--- | :--- | :--- | :--- |
 | `GET` | `/api/v1/branches/{branch_id}/timeline` | *None* | `200 OK` → `list[MessageResponse]`<br>`422 Unprocessable Entity` (некорректное значение `include_inactive`) | Возвращает историю ветки от корня к вершине. Query-параметр `include_inactive` (`bool`, по умолчанию `false`) включает скрытые из контекста сообщения. |
-| `POST` | `/api/v1/branches/{branch_id}/messages` | `SendMessageRequest` | `201 Created` → `MessageResponse` | Записывает реплику пользователя без запуска Gemini. Несколько таких запросов образуют цепочку. |
+| `POST` | `/api/v1/branches/{branch_id}/messages` | `SendMessageRequest` | `201 Created` → `MessageResponse`<br>`409 Conflict` (конфликт записи или повтор ключа с другим текстом) | Записывает реплику пользователя без запуска Gemini. Поддерживает необязательный заголовок `Idempotency-Key` (UUID). |
 | `POST` | `/api/v1/branches/{branch_id}/run` | `RunTurnRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (изменилась вершина или вопрос, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на сохранённый активный вопрос и добавляет его в конец полной цепочки. |
 | `POST` | `/api/v1/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки, исходный вопрос скрыт или нет ответа для перегенерации)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Создаёт форк от вопроса, на который был дан последний активный ответ, и запускает генерацию в новой ветке. |
 | `PATCH` | `/api/v1/messages/{message_id}` | `MessageUpdateContentRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` -> `AncestorMutationWarningResponse` | In-place правка текста (Алгоритм 3.3). Требует `force=True` для предков. |
@@ -692,3 +692,5 @@ class AncestorMutationWarningResponse(BaseModel):
 С `include_inactive=true` скрытое сообщение сохраняет своё место в цепочке и возвращается с `is_active: false`. Флаг относится к сообщению и виден во всех ветках, которые его содержат. Параметр применяется только при чтении истории через API. Gemini по-прежнему получает активные сообщения (Алгоритм 3.1).
 
 Операции над отдельной веткой и сообщением возвращают `404`, если указанный объект отсутствует. Добавление реплики также может вернуть `409`, если конкурентная запись изменила вершину.
+
+Ключ `Idempotency-Key` действует в пределах ветки. Повтор с тем же ключом и исходным текстом возвращает существующую реплику с тем же ID и статусом `201`, даже если она была отредактирована или вершина ветки продвинулась. Повтор ключа с другим текстом возвращает `409`. Запись ключа и реплики фиксируется в одной транзакции. Запросы без ключа добавляют новую реплику.

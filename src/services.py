@@ -1,6 +1,7 @@
 import json
+from hashlib import sha256
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient
@@ -10,6 +11,7 @@ from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
     GraphEngineError,
+    GraphIntegrityError,
     MergeResult,
     MessageNotFoundError,
     branch_from_here,
@@ -20,7 +22,7 @@ from src.storage.crud.graph import (
     toggle_message_active,
     update_message_content,
 )
-from src.storage.models import Branch, Chat, Message, MessageRole
+from src.storage.models import Branch, Chat, Message, MessageRole, MessageSubmission
 
 
 class ChatNotFoundError(GraphEngineError):
@@ -92,10 +94,33 @@ async def get_timeline(
     )
 
 
-async def send_message(session: AsyncSession, branch_id: str, content: str) -> Message:
+async def send_message(
+    session: AsyncSession, branch_id: str, content: str, idempotency_key: str | None = None,
+) -> Message:
     async with session.begin():
+        if idempotency_key is not None:
+            # Acquire SQLite's writer slot before looking up the receipt.
+            # A simultaneous retry will then read the committed result.
+            await session.execute(text("BEGIN IMMEDIATE"))
         branch = await _require_branch(session, branch_id)
-        return await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+        if idempotency_key is None:
+            return await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+
+        content_hash = sha256(content.encode("utf-8")).hexdigest()
+        receipt = await session.get(MessageSubmission, (branch_id, idempotency_key))
+        if receipt is not None:
+            if receipt.content_hash != content_hash:
+                raise BranchConflictError("Этот ключ отправки уже использован для другого текста.")
+            message = await session.get(Message, receipt.message_id)
+            if message is None or message.chat_id != branch.chat_id:
+                raise GraphIntegrityError("Запись об отправке не соответствует сохранённой реплике.")
+            return message
+
+        message = await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+        session.add(MessageSubmission(
+            branch_id=branch_id, key=idempotency_key, content_hash=content_hash, message_id=message.id,
+        ))
+        return message
 
 
 async def generate_reply(

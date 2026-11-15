@@ -26,7 +26,7 @@ interface WorkspaceState extends WorkspaceData {
   selectChat: (chatId: string, preferredBranchId?: string) => Promise<void>
   selectBranch: (branchId: string) => Promise<void>
   createChat: (title: string) => Promise<void>
-  sendMessage: (branchId: string, content: string, generate: boolean) => Promise<boolean>
+  sendMessage: (branchId: string, content: string, generate: boolean, submissionKey: string) => Promise<boolean>
   runBranch: (branchId: string, target: RunTarget) => Promise<void>
   editMessage: (message: MessageResponse, content: string, force: boolean) => Promise<boolean>
   toggleMessage: (message: MessageResponse) => Promise<boolean>
@@ -234,18 +234,18 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       void get().selectChat(chat.id)
     },
 
-    async sendMessage(branchId, content, generate) {
+    async sendMessage(branchId, content, generate, submissionKey) {
       if (branchIsBusy(branchId) || !content.trim()) return false
       const startedAt = revision
       setTurn(branchId, { status: 'saving' })
       let saved: MessageResponse
       try {
-        saved = await api.sendMessage(branchId, content)
+        saved = await api.sendMessage(branchId, content, submissionKey)
       } catch (error) {
         if (revision !== startedAt) return false
         setTurn(branchId, {
           status: 'error',
-          message: requestErrorMessage(error, 'Не удалось сохранить реплику. Черновик сохранён.'),
+          message: requestErrorMessage(error, 'Не удалось подтвердить сохранение. Повторите отправку того же текста.'),
         })
         if (error instanceof ApiError && error.status === 409) refreshIfSelected(branchId)
         return false

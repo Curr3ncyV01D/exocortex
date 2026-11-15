@@ -1,5 +1,47 @@
 const draftKey = (branchId: string) => `exocortex.draft.${branchId}`
 const draftCleared = 'exocortex:draft-cleared'
+const submissionKey = (branchId: string) => `exocortex.submission.${branchId}`
+
+interface PendingSubmission {
+  key: string
+  content: string
+}
+
+const inMemorySubmissions = new Map<string, PendingSubmission>()
+
+function readSubmission(branchId: string): PendingSubmission | null | undefined {
+  const fallback = inMemorySubmissions.get(branchId)
+  if (fallback) return fallback
+  try {
+    return JSON.parse(localStorage.getItem(submissionKey(branchId)) ?? 'null') as PendingSubmission | null
+  } catch {
+    return undefined
+  }
+}
+
+export function startSubmission(branchId: string, content: string): string {
+  const previous = readSubmission(branchId)
+  if (previous?.content === content && typeof previous.key === 'string') return previous.key
+
+  const submission = { content, key: crypto.randomUUID() }
+  try {
+    localStorage.setItem(submissionKey(branchId), JSON.stringify(submission))
+    inMemorySubmissions.delete(branchId)
+  } catch {
+    inMemorySubmissions.set(branchId, submission)
+  }
+  return submission.key
+}
+
+export function finishSubmission(branchId: string, key: string): void {
+  if (readSubmission(branchId)?.key !== key) return
+  inMemorySubmissions.delete(branchId)
+  try {
+    localStorage.removeItem(submissionKey(branchId))
+  } catch {
+    // The in-memory fallback is already cleared.
+  }
+}
 
 interface SentDraft {
   branchId: string

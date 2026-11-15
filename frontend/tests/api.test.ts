@@ -41,7 +41,9 @@ describe('REST API client', () => {
       .mockResolvedValueOnce(Response.json(timeline[1]))
     vi.stubGlobal('fetch', fetchMock)
 
-    expect(await api.sendMessage(main.id, saved.content)).toEqual(saved)
+    const key = '1fa3bfaf-ff23-43d5-be33-acaa0dd57843'
+    expect(await api.sendMessage(main.id, saved.content, key)).toEqual(saved)
+    expect(fetchMock.mock.calls[0][1].headers['Idempotency-Key']).toBe(key)
     expect(await api.runTurn(main.id, { headId: 'structural-head', questionId: saved.id })).toEqual(timeline[1])
     expect(fetchMock.mock.calls.map(([url, options]) => [url, options.method, JSON.parse(options.body)])).toEqual([
       ['/api/v1/branches/branch-main/messages', 'POST', { content: saved.content }],

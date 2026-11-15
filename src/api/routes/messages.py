@@ -1,4 +1,7 @@
-from fastapi import APIRouter
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Header
 
 from src import services
 from src.api.deps import SessionDep
@@ -18,8 +21,14 @@ router = APIRouter(tags=["messages"], responses={404: {"model": ErrorResponse}})
     "/branches/{branch_id}/messages", response_model=MessageResponse, status_code=201,
     responses={409: {"model": ErrorResponse}},
 )
-async def send_message(branch_id: str, payload: SendMessageRequest, session: SessionDep):
-    return await services.send_message(session, branch_id, payload.content)
+async def send_message(
+    branch_id: str,
+    payload: SendMessageRequest,
+    session: SessionDep,
+    idempotency_key: Annotated[UUID | None, Header()] = None,
+):
+    key = str(idempotency_key) if idempotency_key is not None else None
+    return await services.send_message(session, branch_id, payload.content, key)
 
 
 @router.patch(

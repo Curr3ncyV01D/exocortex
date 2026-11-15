@@ -76,8 +76,12 @@ export const api = {
       `/branches/${encodeURIComponent(branchId)}/timeline?include_inactive=true`, { signal },
     ),
 
-  sendMessage: (branchId: string, content: string) =>
-    post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/messages`, { content }),
+  sendMessage: (branchId: string, content: string, submissionKey: string) =>
+    request<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': submissionKey },
+      body: JSON.stringify({ content }),
+    }),
 
   runTurn: (branchId: string, target: RunTarget) =>
     post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/run`, {
