@@ -39,6 +39,20 @@ export interface RunTarget {
   questionId: string
 }
 
+export interface BranchMergeResponse {
+  status: 'success'
+  merge_message_id: string
+  source_branch: string
+  target_branch: 'main'
+  compressed_messages_count: number
+  summary: string
+}
+
+export interface RegenerateReplyResponse {
+  branch: BranchResponse
+  message: MessageResponse
+}
+
 export interface AncestorMutationWarningResponse {
   detail: 'ANCESTOR_MUTATION_WARNING'
   affected_branch_count: number

@@ -1,5 +1,6 @@
 import type {
-  AncestorMutationWarningResponse, BranchResponse, ChatResponse, MessageResponse, RunTarget, ToggleActiveResponse,
+  AncestorMutationWarningResponse, BranchMergeResponse, BranchResponse, ChatResponse,
+  MessageResponse, RegenerateReplyResponse, RunTarget, ToggleActiveResponse,
 } from './types'
 
 const apiPrefix = '/api/v1'
@@ -28,6 +29,16 @@ export function isAncestorWarning(error: unknown): error is ApiError & { body: A
     && 'detail' in body && body.detail === 'ANCESTOR_MUTATION_WARNING'
     && 'affected_branch_count' in body && typeof body.affected_branch_count === 'number'
     && 'message' in body && typeof body.message === 'string'
+}
+
+export function savedRegenerationFork(error: unknown): { branch_id: string; head_message_id: string } | undefined {
+  if (!(error instanceof ApiError) || (error.status !== 413 && error.status !== 502)) return
+  const { body } = error
+  if (body && typeof body === 'object'
+    && 'branch_id' in body && typeof body.branch_id === 'string' && body.branch_id
+    && 'head_message_id' in body && typeof body.head_message_id === 'string' && body.head_message_id) {
+    return { branch_id: body.branch_id, head_message_id: body.head_message_id }
+  }
 }
 
 async function request<T>(path: string, options: RequestInit): Promise<T> {
@@ -82,4 +93,13 @@ export const api = {
 
   createBranch: (chatId: string, targetMessageId: string, name: string) =>
     post<BranchResponse>(`/chats/${encodeURIComponent(chatId)}/branches`, { target_message_id: targetMessageId, name }),
+
+  mergeIntoMain: (branchId: string) =>
+    post<BranchMergeResponse>(`/branches/${encodeURIComponent(branchId)}/merge`, { target_branch: 'main' }),
+
+  regenerate: (branchId: string, headId: string, name: string) =>
+    post<RegenerateReplyResponse>(`/branches/${encodeURIComponent(branchId)}/regenerate`, {
+      expected_head_id: headId,
+      new_branch_name: name,
+    }),
 }

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { LoadError } from '../../components/LoadError'
 import { useWorkspace } from '../../store/workspace'
 import { BranchPicker } from '../branches/BranchPicker'
+import { MergeAction } from '../branches/MergeAction'
 import { ChatInput } from './ChatInput'
 import { MessageTimeline } from './MessageTimeline'
 
@@ -15,6 +16,8 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
   const selectChat = useWorkspace((state) => state.selectChat)
   const selectBranch = useWorkspace((state) => state.selectBranch)
   const chat = chats.status === 'ready' ? chats.data.find(({ id }) => id === activeChatId) : undefined
+  const activeBranch = branches.status === 'ready' ? branches.data.find(({ id }) => id === activeBranchId) : undefined
+  const mainId = branches.status === 'ready' ? branches.data.find(({ name }) => name === 'main')?.id : undefined
   const scrollArea = useRef<HTMLDivElement>(null)
   const head = timeline.status === 'ready' ? timeline.data.at(-1) : undefined
   const headId = head?.id
@@ -39,6 +42,9 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
             {branches.status === 'ready' && activeBranchId && (
               <BranchPicker branches={branches.data} activeBranchId={activeBranchId} onSelect={selectBranch} />
             )}
+            {activeBranch && mainId && activeBranch.id !== mainId && (
+              <MergeAction key={activeBranch.id} source={activeBranch} mainId={mainId} />
+            )}
             {navigation}
           </div>
         </div>
@@ -50,7 +56,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
           {branches.status === 'loading' && <p role="status" className="text-sm text-muted">Загружаем ветки…</p>}
           {branches.status === 'error' && activeChatId && (
-            <LoadError message={branches.message} retry={() => { void selectChat(activeChatId) }} />
+            <LoadError message={branches.message} retry={() => { void selectChat(activeChatId, activeBranchId ?? undefined) }} />
           )}
           {branches.status === 'ready' && branches.data.length === 0 && (
             <p className="text-sm text-muted">В этом чате пока нет веток.</p>
@@ -61,7 +67,11 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
           {timeline.status === 'ready' && (
             timeline.data.length > 0
-              ? <MessageTimeline messages={timeline.data} branchId={activeBranchId ?? undefined} />
+              ? <MessageTimeline
+                  messages={timeline.data}
+                  branchId={activeBranchId ?? undefined}
+                  regeneration={headId && dialogue?.role === 'model' ? { messageId: dialogue.id, headId } : undefined}
+                />
               : <p className="text-sm text-muted">В этой ветке пока нет сообщений.</p>
           )}
         </div>

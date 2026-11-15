@@ -2,76 +2,24 @@ import { useId, useLayoutEffect, useRef, useState } from 'react'
 import { requestErrorMessage } from '../../api/client'
 import type { MessageResponse } from '../../api/types'
 import { useWorkspace } from '../../store/workspace'
-import { MessageDialog } from './MessageDialog'
+import { BranchNameDialog } from '../branches/BranchNameDialog'
 
 interface MessageActionsProps {
   message: MessageResponse
   branchId: string
   onEdit: () => void
+  regenerateHeadId?: string
 }
 
-const branchNamePattern = /^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/
-
-function ForkDialog({ message, branchId, onClose }: Omit<MessageActionsProps, 'onEdit'> & { onClose: () => void }) {
+export function MessageActions({ message, branchId, onEdit, regenerateHeadId }: MessageActionsProps) {
   const forkBranch = useWorkspace((state) => state.forkBranch)
-  const [name, setName] = useState('')
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const nameId = useId()
-
-  async function create() {
-    if (pending) return
-    if (name.length > 64 || !branchNamePattern.test(name)) {
-      setError('Введите имя до 64 символов. Используйте латиницу, цифры, дефис, подчёркивание и слэши между сегментами.')
-      return
-    }
-    setPending(true)
-    setError(null)
-    try {
-      await forkBranch(branchId, message, name)
-      onClose()
-    } catch (failure) {
-      setError(requestErrorMessage(failure, 'Не удалось создать ветку.'))
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <MessageDialog title="Создать ветку" pending={pending} onCancel={onClose}>
-      <form
-        onSubmit={(event) => {
-          event.preventDefault()
-          void create()
-        }}
-      >
-        <label htmlFor={nameId} className="mb-1.5 block text-sm text-muted">Имя ветки</label>
-        <input
-          id={nameId}
-          className="field w-full"
-          placeholder="feature/notes"
-          value={name}
-          readOnly={pending}
-          autoComplete="off"
-          onChange={(event) => setName(event.target.value)}
-        />
-        {error && <p role="alert" className="mt-2 text-sm text-rose-200">{error}</p>}
-        <div className="message-dialog-actions">
-          <button type="button" className="button-secondary" disabled={pending} onClick={onClose}>Отмена</button>
-          <button type="submit" className="button-primary" disabled={pending}>
-            {pending ? 'Создаём…' : 'Создать ветку'}
-          </button>
-        </div>
-      </form>
-    </MessageDialog>
-  )
-}
-
-export function MessageActions({ message, branchId, onEdit }: MessageActionsProps) {
+  const regenerateBranch = useWorkspace((state) => state.regenerateBranch)
+  const status = useWorkspace((state) => regenerateHeadId ? state.turns[branchId]?.status : undefined)
+  const running = status === 'saving' || status === 'generating'
   const toggleMessage = useWorkspace((state) => state.toggleMessage)
   const pending = useWorkspace((state) => state.mutatingMessages.has(message.id))
   const [menuOpen, setMenuOpen] = useState(false)
-  const [forkOpen, setForkOpen] = useState(false)
+  const [branchDialog, setBranchDialog] = useState<'fork' | 'regenerate' | null>(null)
   const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null)
   const menuTrigger = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
@@ -131,6 +79,18 @@ export function MessageActions({ message, branchId, onEdit }: MessageActionsProp
         <button type="button" className="message-action" aria-label="Редактировать сообщение" title="Редактировать" disabled={pending} onClick={onEdit}>
           <span aria-hidden="true">✎</span>
         </button>
+        {regenerateHeadId && (
+          <button
+            type="button"
+            className="message-action"
+            aria-label="Перегенерировать ответ"
+            title="Перегенерировать в новой ветке"
+            disabled={running}
+            onClick={() => setBranchDialog('regenerate')}
+          >
+            <span aria-hidden="true">✧</span>
+          </button>
+        )}
         <button
           ref={menuTrigger}
           type="button"
@@ -145,7 +105,7 @@ export function MessageActions({ message, branchId, onEdit }: MessageActionsProp
         </button>
         {menuOpen && (
           <div ref={menu} id={actionsId} className="message-action-menu">
-            <button type="button" onClick={() => { closeMenu(); setForkOpen(true) }}>Создать ветку отсюда</button>
+            <button type="button" onClick={() => { closeMenu(); setBranchDialog('fork') }}>Создать ветку отсюда</button>
             <button type="button" disabled={pending} onClick={() => void toggle()}>
               {message.is_active ? 'Скрыть из контекста' : 'Вернуть в контекст'}
             </button>
@@ -156,7 +116,26 @@ export function MessageActions({ message, branchId, onEdit }: MessageActionsProp
       {notice && (
         <p role={notice.error ? 'alert' : 'status'} className={notice.error ? 'text-rose-200' : 'text-muted'}>{notice.text}</p>
       )}
-      {forkOpen && <ForkDialog message={message} branchId={branchId} onClose={() => setForkOpen(false)} />}
+      {branchDialog === 'fork' && (
+        <BranchNameDialog
+          title="Создать ветку"
+          submitLabel="Создать ветку"
+          pendingLabel="Создаём…"
+          errorMessage="Не удалось создать ветку."
+          onSubmit={(name) => forkBranch(branchId, message, name)}
+          onClose={() => setBranchDialog(null)}
+        />
+      )}
+      {branchDialog === 'regenerate' && regenerateHeadId && (
+        <BranchNameDialog
+          title="Перегенерировать в новой ветке"
+          submitLabel="Перегенерировать"
+          pendingLabel="Генерируем…"
+          errorMessage="Не удалось перегенерировать ответ."
+          onSubmit={(name) => regenerateBranch({ id: branchId, chat_id: message.chat_id }, regenerateHeadId, name)}
+          onClose={() => setBranchDialog(null)}
+        />
+      )}
     </>
   )
 }

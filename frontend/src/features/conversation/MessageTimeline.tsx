@@ -34,7 +34,13 @@ function MessageMarkdown({ content }: { content: string }) {
   )
 }
 
-function MessageCard({ message, branchId }: { message: MessageResponse; branchId?: string }) {
+interface MessageCardProps {
+  message: MessageResponse
+  branchId?: string
+  regenerateHeadId?: string
+}
+
+function MessageCard({ message, branchId, regenerateHeadId }: MessageCardProps) {
   const [editing, setEditing] = useState(false)
   const created = new Date(message.created_at)
   const trace = message.role === 'model' ? readExecutionTrace(message.metadata) : null
@@ -59,7 +65,12 @@ function MessageCard({ message, branchId }: { message: MessageResponse; branchId
         <div className="ml-auto flex items-center gap-2">
           {duration && <span className="message-duration tabular-nums" title="Длительность генерации">{duration}</span>}
           {branchId && !editing && (
-            <MessageActions message={message} branchId={branchId} onEdit={() => setEditing(true)} />
+            <MessageActions
+              message={message}
+              branchId={branchId}
+              regenerateHeadId={regenerateHeadId}
+              onEdit={() => setEditing(true)}
+            />
           )}
         </div>
       </div>
@@ -98,10 +109,23 @@ function MessageCard({ message, branchId }: { message: MessageResponse; branchId
   )
 }
 
-export function MessageTimeline({ messages, branchId }: { messages: MessageResponse[]; branchId?: string }) {
+interface MessageTimelineProps {
+  messages: MessageResponse[]
+  branchId?: string
+  regeneration?: { messageId: string; headId: string }
+}
+
+export function MessageTimeline({ messages, branchId, regeneration }: MessageTimelineProps) {
   return (
     <ol aria-label="История сообщений" className="space-y-1.5">
-      {messages.map((message) => <MessageCard key={message.id} message={message} branchId={branchId} />)}
+      {messages.map((message) => (
+        <MessageCard
+          key={message.id}
+          message={message}
+          branchId={branchId}
+          regenerateHeadId={regeneration?.messageId === message.id ? regeneration.headId : undefined}
+        />
+      ))}
     </ol>
   )
 }

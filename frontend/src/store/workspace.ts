@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api, ApiError, requestErrorMessage } from '../api/client'
+import { api, ApiError, requestErrorMessage, savedRegenerationFork } from '../api/client'
 import type { BranchResponse, ChatResponse, MessageResponse, RunTarget } from '../api/types'
 
 type Resource<T> =
@@ -23,7 +23,7 @@ interface WorkspaceData {
 
 interface WorkspaceState extends WorkspaceData {
   loadChats: () => Promise<void>
-  selectChat: (chatId: string) => Promise<void>
+  selectChat: (chatId: string, preferredBranchId?: string) => Promise<void>
   selectBranch: (branchId: string) => Promise<void>
   createChat: (title: string) => Promise<void>
   sendMessage: (branchId: string, content: string, generate: boolean) => Promise<boolean>
@@ -31,6 +31,8 @@ interface WorkspaceState extends WorkspaceData {
   editMessage: (message: MessageResponse, content: string, force: boolean) => Promise<boolean>
   toggleMessage: (message: MessageResponse) => Promise<boolean>
   forkBranch: (sourceBranchId: string, message: MessageResponse, name: string) => Promise<void>
+  mergeBranch: (source: BranchResponse, mainId: string) => Promise<void>
+  regenerateBranch: (source: Pick<BranchResponse, 'id' | 'chat_id'>, headId: string, name: string) => Promise<void>
   reset: () => void
 }
 
@@ -51,6 +53,19 @@ function updateBranchHead(branches: WorkspaceData['branches'], branchId: string,
     data: branches.data.map((branch) =>
       branch.id === branchId ? { ...branch, head_message_id: headId } : branch,
     ),
+  }
+}
+
+function generationFailure(error: unknown, target: RunTarget, prefix = ''): TurnState {
+  const status = error instanceof ApiError ? error.status : undefined
+  const message = status === 413
+    ? 'Вопрос сохранён. Сократите его через «Редактировать».'
+    : requestErrorMessage(error, 'Не удалось получить ответ. Вопрос сохранён.')
+  return {
+    status: 'error',
+    message: prefix + message,
+    retryTarget: status === 502 || status === undefined ? target : undefined,
+    oversizedQuestionId: status === 413 ? target.questionId : undefined,
   }
 }
 
@@ -75,6 +90,15 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
   function refreshIfSelected(branchId: string) {
     if (get().activeBranchId === branchId) void get().selectBranch(branchId)
+  }
+
+  function openNewBranch(sourceBranchId: string, branch: BranchResponse) {
+    const { activeChatId, activeBranchId, branches } = get()
+    if (activeChatId !== branch.chat_id || branches.status !== 'ready') return
+    if (!branches.data.some(({ id }) => id === branch.id)) {
+      set({ branches: { status: 'ready', data: [...branches.data, branch] } })
+    }
+    if (activeBranchId === sourceBranchId) void get().selectBranch(branch.id)
   }
 
   async function mutateMessage(
@@ -136,14 +160,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     } catch (error) {
       if (revision !== startedAt) return
       const status = error instanceof ApiError ? error.status : undefined
-      setTurn(branchId, {
-        status: 'error',
-        message: status === 413
-          ? 'Вопрос сохранён. Сократите его через «Редактировать».'
-          : requestErrorMessage(error, 'Не удалось получить ответ. Вопрос сохранён.'),
-        retryTarget: status === 502 || status === undefined ? target : undefined,
-        oversizedQuestionId: status === 413 ? target.questionId : undefined,
-      })
+      setTurn(branchId, generationFailure(error, target))
       // Re-read the head if a conflict or an interrupted response left it uncertain.
       if (status === 409 || status === undefined) refreshIfSelected(branchId)
     }
@@ -167,13 +184,13 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       }
     },
 
-    async selectChat(chatId) {
+    async selectChat(chatId, preferredBranchId) {
       branchesRequest?.abort()
       timelineRequest?.abort()
       const request = branchesRequest = new AbortController()
       set({
         activeChatId: chatId,
-        activeBranchId: null,
+        activeBranchId: preferredBranchId ?? null,
         branches: { status: 'loading' },
         timeline: { status: 'idle' },
       })
@@ -181,7 +198,8 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
         const branches = await api.listBranches(chatId, request.signal)
         if (request.signal.aborted) return
         set({ branches: { status: 'ready', data: branches } })
-        const branch = branches.find(({ name }) => name === 'main') ?? branches[0]
+        const branch = branches.find(({ id }) => id === preferredBranchId)
+          ?? branches.find(({ name }) => name === 'main') ?? branches[0]
         if (branch) void get().selectBranch(branch.id)
       } catch (error) {
         if (request.signal.aborted) return
@@ -270,12 +288,36 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     async forkBranch(sourceBranchId, message, name) {
       const startedAt = revision
       const branch = await api.createBranch(message.chat_id, message.id, name)
-      const { activeChatId, activeBranchId, branches } = get()
-      if (revision !== startedAt || activeChatId !== message.chat_id || branches.status !== 'ready') return
-      if (!branches.data.some(({ id }) => id === branch.id)) {
-        set({ branches: { status: 'ready', data: [...branches.data, branch] } })
+      if (revision === startedAt) openNewBranch(sourceBranchId, branch)
+    },
+
+    async mergeBranch(source, mainId) {
+      const startedAt = revision
+      await api.mergeIntoMain(source.id)
+      const { activeChatId, activeBranchId } = get()
+      if (revision === startedAt && activeChatId === source.chat_id) {
+        const preferredBranchId = activeBranchId === source.id ? mainId : activeBranchId ?? undefined
+        await get().selectChat(source.chat_id, preferredBranchId)
       }
-      if (activeBranchId === sourceBranchId) void get().selectBranch(branch.id)
+    },
+
+    async regenerateBranch(source, headId, name) {
+      const startedAt = revision
+      try {
+        const { branch } = await api.regenerate(source.id, headId, name)
+        if (revision === startedAt) openNewBranch(source.id, branch)
+      } catch (error) {
+        const fork = savedRegenerationFork(error)
+        if (!fork) throw error
+        if (revision !== startedAt) return
+        const target = { headId: fork.head_message_id, questionId: fork.head_message_id }
+        setTurn(fork.branch_id, generationFailure(error, target, 'Ветка создана. '))
+        const { activeChatId, activeBranchId } = get()
+        if (activeChatId === source.chat_id) {
+          const preferred = activeBranchId === source.id ? fork.branch_id : activeBranchId ?? undefined
+          await get().selectChat(source.chat_id, preferred)
+        }
+      }
     },
 
     reset() {
