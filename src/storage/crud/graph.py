@@ -128,11 +128,11 @@ async def reconstruct_context(
 
 
 async def read_context_from_head(
-    chat_id: str, head_id: str | None, session: AsyncSession,
+    chat_id: str, head_id: str | None, session: AsyncSession, *, include_inactive: bool = False,
 ) -> list[Message]:
-    """Читает активные узлы от заданной вершины."""
+    """Читает цепочку от заданной вершины в хронологическом порядке."""
     history = await _read_history(chat_id, head_id, session)
-    return [msg for msg in reversed(history) if msg.is_active]
+    return [msg for msg in reversed(history) if include_inactive or msg.is_active]
 
 
 async def _read_history(

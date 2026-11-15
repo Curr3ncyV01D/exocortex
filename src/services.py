@@ -80,9 +80,13 @@ async def create_branch(
         return await branch_from_here(chat_id, target_message_id, name, session)
 
 
-async def get_timeline(session: AsyncSession, branch_id: str) -> list[Message]:
+async def get_timeline(
+    session: AsyncSession, branch_id: str, *, include_inactive: bool = False,
+) -> list[Message]:
     branch = await _require_branch(session, branch_id)
-    return await read_context_from_head(branch.chat_id, branch.head_message_id, session)
+    return await read_context_from_head(
+        branch.chat_id, branch.head_message_id, session, include_inactive=include_inactive,
+    )
 
 
 async def send_message(session: AsyncSession, branch_id: str, content: str) -> Message:

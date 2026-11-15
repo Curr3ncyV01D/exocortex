@@ -71,6 +71,63 @@ async def test_edit_warning_force_and_mask(api_client):
     assert (await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json() == []
 
 
+async def test_timeline_includes_masked_messages_on_request(api_client):
+    _, main = await create_api_chat(api_client)
+    first = await append_api_message(api_client, main.id, "First")
+    hidden = await append_api_message(api_client, main.id, "Masked")
+    latest = await append_api_message(api_client, main.id, "Latest")
+    timeline_url = f"/api/v1/branches/{main.id}/timeline"
+    toggle_url = f"/api/v1/messages/{hidden.id}/toggle-active"
+    assert (await api_client.post(toggle_url)).status_code == 200
+
+    for params in ({}, {"include_inactive": "false"}):
+        active = await api_client.get(timeline_url, params=params)
+        assert active.status_code == 200
+        assert [row["id"] for row in active.json()] == [first.id, latest.id]
+
+    full = await api_client.get(timeline_url, params={"include_inactive": "true"})
+    assert full.status_code == 200
+    messages = [MessageResponse.model_validate(row) for row in full.json()]
+    assert [(msg.id, msg.is_active) for msg in messages] == [
+        (first.id, True), (hidden.id, False), (latest.id, True),
+    ]
+    assert messages[1].content == hidden.content
+    assert messages[2].parent_id == hidden.id
+
+    assert (await api_client.post(toggle_url)).status_code == 200
+    restored = await api_client.get(timeline_url)
+    assert restored.status_code == 200
+    assert [(row["id"], row["is_active"]) for row in restored.json()] == [
+        (first.id, True), (hidden.id, True), (latest.id, True),
+    ]
+
+
+async def test_timeline_rejects_invalid_include_inactive(api_client):
+    _, main = await create_api_chat(api_client)
+    response = await api_client.get(
+        f"/api/v1/branches/{main.id}/timeline", params={"include_inactive": "invalid"},
+    )
+    assert response.status_code == 422
+
+
+async def test_run_excludes_messages_visible_only_in_full_timeline(api_client, api_gemini):
+    _, main = await create_api_chat(api_client)
+    hidden = await append_api_message(api_client, main.id, "Masked prompt")
+    latest = await append_api_message(api_client, main.id, "Active prompt")
+    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+
+    url = f"/api/v1/branches/{main.id}"
+    full = await api_client.get(f"{url}/timeline", params={"include_inactive": "true"})
+    assert full.status_code == 200
+    assert [row["id"] for row in full.json()] == [hidden.id, latest.id]
+
+    run = await api_client.post(f"{url}/run", json={"expected_head_id": latest.id})
+    assert run.status_code == 200
+    api_gemini.generate_step.assert_awaited_once()
+    contents = api_gemini.generate_step.await_args.kwargs["contents"]
+    assert [part.text for message in contents for part in message.parts] == [latest.content]
+
+
 async def test_merge_empty_delta(api_client, api_gemini):
     chat, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "Question")
