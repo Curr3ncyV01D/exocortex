@@ -546,7 +546,7 @@ flowchart LR
 
 ```python
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 from uuid import UUID
 from pydantic import BaseModel, Field
 from enum import Enum
@@ -572,8 +572,13 @@ class ChatResponse(BaseModel):
     updated_at: datetime
 
 # --- Схемы веток ---
+BranchName = Annotated[
+    str,
+    Field(min_length=1, max_length=64, pattern=r"^[A-Za-zА-Яа-яЁё0-9_-]+(?:(?: +|/)[A-Za-zА-Яа-яЁё0-9_-]+)*$"),
+]
+
 class BranchCreateRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$")
+    name: BranchName
     target_message_id: str = Field(..., description="ID узла, от которого создается форк")
 
 class BranchResponse(BaseModel):
@@ -619,10 +624,7 @@ class RunTurnRequest(BaseModel):
 
 class RegenerateReplyRequest(BaseModel):
     expected_head_id: UUID
-    new_branch_name: str = Field(
-        ..., min_length=1, max_length=64,
-        pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$",
-    )
+    new_branch_name: BranchName
 
 class RegenerateReplyResponse(BaseModel):
     branch: BranchResponse
@@ -651,7 +653,7 @@ class AncestorMutationWarningResponse(BaseModel):
 
 При сбое Gemini новая ветка уже сохранена и доступна для повторной генерации. Ответ `413` или `502` после создания форка включает поля `detail`, `branch_id` и `head_message_id`.
 
-Маршруты адресуют ветку по строковому `branch_id` (UUID). В имени ветки слэш разделяет непустые сегменты, например `feature/refactor`. Ведущие, хвостовые и двойные слэши отклоняются.
+Маршруты адресуют ветку по строковому `branch_id` (UUID). Имя ветки содержит от 1 до 64 символов. Допустимы латинские и русские буквы (включая `Ё` и `ё`), цифры, дефисы и подчёркивания. Пробелы допустимы внутри сегментов, например в имени `исследование/Заметки RAG`. Слэш разделяет непустые сегменты. Пробелы на краях сегмента и ведущие, хвостовые или двойные слэши отклоняются. Имя сохраняется как введено и должно быть уникальным в пределах чата.
 
 `/run` принимает необязательные поля `expected_head_id` и `expected_question_id`. Первое проверяет фактическую вершину, второе проверяет активный вопрос при запуске или повторе. Несовпадение переданного ID возвращает `409` до обращения к Gemini. При записи ответа ядро повторно проверяет вершину. В `/regenerate` ожидаемая фактическая вершина обязательна, а транспорт проверяет её в транзакции создания форка.
 

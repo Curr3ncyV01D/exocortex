@@ -6,11 +6,12 @@ import type { MessageResponse } from '../src/api/types'
 import { chat, main, side, timeline } from './fixtures'
 
 const original: MessageResponse = { ...timeline[0], role: 'user', content: '**Исходная реплика**' }
+const branchName = 'исследование/Разбор ёлки'
 const editTimestamp = '2026-11-16T14:35:00Z'
 
 function mockMessageApi({ shared = false, forkConflict = false, editConflict = false } = {}) {
   let message = original
-  const fork = { ...side, id: 'new-branch', name: 'feature/notes', head_message_id: original.id }
+  const fork = { ...side, id: 'new-branch', name: branchName, head_message_id: original.id }
   const branches = shared ? [main, side] : [main]
   const requests: { method: string; path: string; body?: unknown }[] = []
   vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit) => {
@@ -137,13 +138,13 @@ it('creates a named branch from the selected message and switches to it', async 
   await menuAction(user, 'Создать ветку отсюда')
   const dialog = await screen.findByRole('dialog', { name: 'Создать ветку' })
   within(dialog).getByRole('textbox', { name: 'Имя ветки' }).focus()
-  await user.keyboard('feature/notes')
+  await user.keyboard(branchName)
   await user.click(within(dialog).getByRole('button', { name: 'Создать ветку' }))
-  await screen.findByRole('option', { name: 'feature/notes' })
+  await screen.findByRole('option', { name: branchName })
   expect(screen.getByRole('combobox', { name: 'Ветка' })).toHaveValue('new-branch')
   expect(requests).toEqual([{
     path: '/api/v1/chats/chat-1/branches', method: 'POST',
-    body: { name: 'feature/notes', target_message_id: original.id },
+    body: { name: branchName, target_message_id: original.id },
   }])
 })
 
@@ -155,7 +156,7 @@ it('validates branch segments and retains the name when the server rejects a dup
   const dialog = await screen.findByRole('dialog', { name: 'Создать ветку' })
   const name = within(dialog).getByRole('textbox', { name: 'Имя ветки' })
   name.focus()
-  await user.keyboard('feature//notes')
+  await user.keyboard('разбор/ заметки')
   await user.click(within(dialog).getByRole('button', { name: 'Создать ветку' }))
   expect(await within(dialog).findByRole('alert')).toBeVisible()
   expect(requests).toHaveLength(0)

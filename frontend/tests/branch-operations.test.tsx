@@ -10,7 +10,7 @@ const answer: MessageResponse = { ...timeline[1], role: 'model', content: 'Ис�
 const hidden: MessageResponse = { ...question, id: 'hidden', parent_id: answer.id, is_active: false }
 const summary: MessageResponse = { ...timeline[2], role: 'system_merge', content: 'Выжимка боковой ветки' }
 const fork: BranchResponse = {
-  ...side, status: 'active', id: 'fork', name: 'retry/new', forked_from_id: question.id, head_message_id: question.id,
+  ...side, status: 'active', id: 'fork', name: 'Повтор/Вторая версия', forked_from_id: question.id, head_message_id: question.id,
 }
 const rerun: MessageResponse = { ...answer, id: 'rerun', content: 'Новый ответ', parent_id: question.id }
 

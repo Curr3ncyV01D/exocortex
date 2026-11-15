@@ -24,7 +24,11 @@ async def test_create_and_list_chats(api_client):
     assert [ChatResponse.model_validate(row) for row in response.json()] == [chat]
 
 
-@pytest.mark.parametrize("name", ["bad name", "/side", "side/", "side//child"])
+@pytest.mark.parametrize("name", [
+    " ветка", "ветка ", "разбор/ заметки", "разбор /заметки",
+    "/side", "side/", "side//child", "ветка\tзаметки", "ветка\n", "ветка#",
+    "я" * 65,
+])
 async def test_invalid_branch_name(api_client, name):
     chat, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "Question")
@@ -32,6 +36,22 @@ async def test_invalid_branch_name(api_client, name):
         "name": name, "target_message_id": first.id,
     })
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("name", ["Разбор архитектуры", "исследование/Ёлка RAG", "я" * 64])
+async def test_create_branch_preserves_localized_name(api_client: AsyncClient, name: str) -> None:
+    chat, main = await create_api_chat(api_client)
+    question = await append_api_message(api_client, main.id, "Question")
+    endpoint = f"/api/v1/chats/{chat.id}/branches"
+    payload = {"name": name, "target_message_id": question.id}
+    created = await api_client.post(endpoint, json=payload)
+    assert created.status_code == 201, created.text
+    branch = BranchResponse.model_validate(created.json())
+    assert branch.name == name
+    assert (await api_client.post(endpoint, json=payload)).status_code == 409
+    history = await api_client.get(f"/api/v1/branches/{branch.id}/timeline")
+    assert history.status_code == 200
+    assert [row["id"] for row in history.json()] == [question.id]
 
 
 @pytest.mark.parametrize("content", ["", "  "])
@@ -362,12 +382,13 @@ async def test_regenerate_validates_head_and_preserves_original_branch(api_clien
     run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={})
     assert run.status_code == 200
     url = f"/api/v1/branches/{main.id}/regenerate"
-    body = {"new_branch_name": "retry/one"}
+    body = {"new_branch_name": "Повтор/Вторая версия"}
     assert (await api_client.post(url, json=body)).status_code == 422
     assert (await api_client.post(url, json={**body, "expected_head_id": first.id})).status_code == 409
     response = await api_client.post(url, json={**body, "expected_head_id": run.json()["id"]})
     assert response.status_code == 201, response.text
     dto = RegenerateReplyResponse.model_validate(response.json())
+    assert dto.branch.name == body["new_branch_name"]
     assert dto.branch.forked_from_id == first.id
     assert dto.branch.head_message_id == dto.message.id
     assert dto.message.parent_id == first.id

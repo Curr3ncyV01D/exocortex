@@ -2,7 +2,7 @@ import { useId, useState } from 'react'
 import { requestErrorMessage } from '../../api/client'
 import { MessageDialog } from '../conversation/MessageDialog'
 
-const branchNamePattern = /^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/
+const branchNamePattern = /^[A-Za-zА-Яа-яЁё0-9_-]+(?:(?: +|\/)[A-Za-zА-Яа-яЁё0-9_-]+)*$/
 
 interface BranchNameDialogProps {
   title: string
@@ -24,7 +24,7 @@ export function BranchNameDialog({
   async function create() {
     if (pending) return
     if (name.length > 64 || !branchNamePattern.test(name)) {
-      setError('Введите имя до 64 символов. Используйте латиницу, цифры, дефис, подчёркивание и слэши между сегментами.')
+      setError('Введите имя до 64 символов. Допустимы латинские и русские буквы, цифры, дефисы и подчёркивания. Пробелы допустимы внутри сегментов, слэши — между ними.')
       return
     }
     setPending(true)
@@ -51,7 +51,7 @@ export function BranchNameDialog({
         <input
           id={nameId}
           className="field w-full"
-          placeholder="feature/notes"
+          placeholder="исследование/Заметки RAG"
           value={name}
           readOnly={pending}
           autoComplete="off"

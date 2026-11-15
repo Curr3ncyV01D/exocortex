@@ -38,10 +38,11 @@ test('recovers a lost save and completes a conversation, fork and merge', async 
   await reply.getByRole('button', { name: 'Действия с сообщением' }).click()
   await reply.getByRole('button', { name: 'Создать ветку отсюда' }).click()
   const fork = page.getByRole('dialog', { name: 'Создать ветку' })
-  await fork.getByRole('textbox', { name: 'Имя ветки' }).fill('feature/acceptance')
+  const branchName = 'исследование/Приёмка MVP'
+  await fork.getByRole('textbox', { name: 'Имя ветки' }).fill(branchName)
   await fork.getByRole('button', { name: 'Создать ветку' }).click()
   const picker = page.getByRole('combobox', { name: 'Ветка' })
-  await expect(picker.locator('option:checked')).toHaveText('feature/acceptance')
+  await expect(picker.locator('option:checked')).toHaveText(branchName)
   await input.fill('Дополнение в боковой ветке')
   await run.click()
   await expect(answer).toHaveCount(2)
