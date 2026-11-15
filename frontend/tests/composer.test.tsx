@@ -57,6 +57,23 @@ async function focusComposer() {
   return composer
 }
 
+it('resizes the composer with its keyboard-accessible top edge', async () => {
+  mockConversation()
+  const user = userEvent.setup()
+  render(<App />)
+  const composer = await ready()
+  const edge = screen.getByRole('separator', { name: 'Высота поля ввода' })
+  expect(edge).toHaveAttribute('aria-controls', composer.id)
+  expect(edge).toHaveAttribute('aria-valuetext', 'Автоматическая высота')
+
+  edge.focus()
+  await user.keyboard('{ArrowUp}')
+  expect(composer).toHaveStyle({ height: '64px' })
+  expect(edge).toHaveAttribute('aria-valuenow', '64')
+  await user.keyboard('{Home}')
+  expect(composer).toHaveStyle({ height: '48px' })
+})
+
 it('saves the full prompt and uses its id for Ctrl+Enter generation', async () => {
   const { posts } = mockConversation()
   const user = userEvent.setup()

@@ -6,12 +6,18 @@
   --color-panel: #161718;
   --color-surface: #222427;
   --color-line: #ffffff2b;
+  --color-scroll-thumb: #656a72;
   --color-muted: #b0b6be;
   --color-foreground: #eceef1;
   --color-accent: #aac7ff;
 }
 
 @layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-scroll-thumb) transparent;
+  }
+
   body {
     @apply bg-canvas text-foreground antialiased;
     color-scheme: dark;
@@ -48,7 +54,7 @@
     @apply inset-x-3 top-1/2 h-0.5 -translate-y-1/2;
   }
 
-  .workspace-separator:is(:hover, :focus-visible, [data-separator="active"])::after {
+  .workspace-separator:is(:hover, :focus-visible, [data-separator="active"], [data-resizing])::after {
     @apply bg-accent/65;
   }
 
@@ -57,9 +63,14 @@
   }
 
   .chat-input-textarea {
-    @apply block min-h-12 w-full resize-y rounded-lg px-2 py-1.5 text-sm leading-relaxed outline-none placeholder:text-muted;
+    @apply block min-h-12 w-full resize-none overflow-y-auto rounded-lg px-2 py-1.5 text-sm leading-relaxed outline-none placeholder:text-muted;
     max-height: min(28dvh, 11rem);
     field-sizing: content;
+  }
+
+  .chat-input-textarea[data-manual-size] {
+    max-height: max(3rem, 40dvh);
+    field-sizing: fixed;
   }
 
   .chat-input:focus-within {

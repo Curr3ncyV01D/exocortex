@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from 'react'
+import { useId, useLayoutEffect, useRef, useState } from 'react'
 import type { MessageResponse } from '../../api/types'
 import { useWorkspace } from '../../store/workspace'
 import { clearSentDraft, onDraftCleared, readDraft, writeDraft } from './drafts'
@@ -9,8 +9,16 @@ interface ChatInputProps {
   historyReady: boolean
 }
 
+const minInputHeight = 48
+const maxInputHeight = () => Math.max(minInputHeight, Math.floor(window.innerHeight * 0.4))
+
 export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
   const [draft, setDraft] = useState(() => readDraft(branchId))
+  const [height, setHeight] = useState<number>()
+  const [dragging, setDragging] = useState(false)
+  const textarea = useRef<HTMLTextAreaElement>(null)
+  const drag = useRef<{ y: number; height: number } | null>(null)
+  const inputId = useId()
   const turn = useWorkspace((state) => state.turns[branchId])
   const sendMessage = useWorkspace((state) => state.sendMessage)
   const runBranch = useWorkspace((state) => state.runBranch)
@@ -34,22 +42,72 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
     if (await sendMessage(branchId, draft, generate)) clearSentDraft(branchId, draft)
   }
 
+  function currentHeight() {
+    return textarea.current?.offsetHeight || minInputHeight
+  }
+
+  function resizeTo(pixels: number) {
+    setHeight(Math.min(maxInputHeight(), Math.max(minInputHeight, pixels)))
+  }
+
   return (
     <footer className="conversation-column shrink-0 pb-3 md:pb-5">
       <form
-        className="chat-input rounded-2xl border border-line bg-surface p-2.5 shadow-lg shadow-black/25 md:p-3"
+        className="chat-input relative rounded-2xl border border-line bg-surface p-2.5 shadow-lg shadow-black/25 md:p-3"
         aria-label="Ввод сообщения"
         onSubmit={(event) => {
           event.preventDefault()
           void submit(true)
         }}
       >
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Высота поля ввода"
+          aria-controls={inputId}
+          aria-orientation="horizontal"
+          aria-valuemin={minInputHeight}
+          aria-valuemax={maxInputHeight()}
+          aria-valuenow={Math.min(height ?? minInputHeight, maxInputHeight())}
+          aria-valuetext={height === undefined ? 'Автоматическая высота' : undefined}
+          className="workspace-separator absolute inset-x-2 -top-1.5 z-10 h-3 cursor-ns-resize touch-none"
+          data-resizing={dragging || undefined}
+          onPointerDown={(event) => {
+            if (event.button !== 0 || !event.isPrimary) return
+            event.preventDefault()
+            event.currentTarget.focus()
+            event.currentTarget.setPointerCapture(event.pointerId)
+            drag.current = { y: event.clientY, height: currentHeight() }
+            setDragging(true)
+          }}
+          onPointerMove={(event) => {
+            if (event.isPrimary && drag.current) resizeTo(drag.current.height + drag.current.y - event.clientY)
+          }}
+          onLostPointerCapture={() => {
+            drag.current = null
+            setDragging(false)
+          }}
+          onKeyDown={(event) => {
+            switch (event.key) {
+              case 'ArrowUp': resizeTo(currentHeight() + 16); break
+              case 'ArrowDown': resizeTo(currentHeight() - 16); break
+              case 'Home': resizeTo(minInputHeight); break
+              case 'End': resizeTo(maxInputHeight()); break
+              default: return
+            }
+            event.preventDefault()
+          }}
+        />
         <textarea
+          ref={textarea}
+          id={inputId}
           aria-label="Сообщение"
           rows={2}
           value={draft}
           placeholder="Напишите сообщение"
           className="chat-input-textarea"
+          data-manual-size={height !== undefined || undefined}
+          style={height !== undefined ? { height } : undefined}
           onChange={(event) => {
             const text = event.target.value
             setDraft(text)
