@@ -1,11 +1,17 @@
 import pytest
+from httpx import AsyncClient
 
 from src.schemas import BranchMergeResponse, BranchResponse, MessageResponse, RoleEnum
 from tests.conftest import append_api_message, create_api_chat
 
 
 @pytest.mark.asyncio
-async def test_chat_turn_fork_and_squash_merge(api_client, api_gemini):
+async def test_chat_turn_fork_and_squash_merge(api_client: AsyncClient, api_gemini) -> None:
+    """Проверить REST-сценарий от нового чата до сквош-слияния.
+
+    Генерируем ответы в main и в форке с моком Gemini. После слияния
+    проверяем узел выжимки в main, связность истории и указатели обеих веток.
+    """
     chat, main = await create_api_chat(api_client)
     question = await append_api_message(api_client, main.id, "Main question")
     assert question.parent_id is None

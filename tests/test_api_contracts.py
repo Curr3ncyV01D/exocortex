@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import pytest
+from httpx import AsyncClient
 
 from src.config import settings
 from src.agent.loop import run_turn
@@ -51,7 +52,13 @@ async def test_missing_and_duplicate_branch_targets(api_client):
     assert (await api_client.post(url, json=body)).status_code == 409
 
 
-async def test_edit_warning_force_and_mask(api_client):
+async def test_edit_warning_force_and_mask(api_client: AsyncClient) -> None:
+    """Проверить изменение сообщения, общего для двух веток.
+
+    Форк делает исходную реплику общей. Правка требует подтверждения
+    с числом затронутых веток, а после маскирования реплика исчезает
+    из обычной истории main.
+    """
     chat, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "Question")
     assert (await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
@@ -71,7 +78,13 @@ async def test_edit_warning_force_and_mask(api_client):
     assert (await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json() == []
 
 
-async def test_timeline_includes_masked_messages_on_request(api_client):
+async def test_timeline_includes_masked_messages_on_request(api_client: AsyncClient) -> None:
+    """Проверить, что маскирование сохраняет место реплики и связи в истории.
+
+    Скрываем среднюю из трёх реплик и сравниваем обычную и полную выдачу.
+    После снятия маски средняя реплика возвращается в обычную выдачу
+    на прежнее место.
+    """
     _, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "First")
     hidden = await append_api_message(api_client, main.id, "Masked")
@@ -110,7 +123,14 @@ async def test_timeline_rejects_invalid_include_inactive(api_client):
     assert response.status_code == 422
 
 
-async def test_run_excludes_messages_visible_only_in_full_timeline(api_client, api_gemini):
+async def test_run_excludes_messages_visible_only_in_full_timeline(
+    api_client: AsyncClient, api_gemini,
+) -> None:
+    """Проверить разницу между полной историей и контекстом генерации.
+
+    После чтения полной истории запускаем генерацию с активной вершины.
+    В запросе к моку Gemini должна остаться только активная реплика.
+    """
     _, main = await create_api_chat(api_client)
     hidden = await append_api_message(api_client, main.id, "Masked prompt")
     latest = await append_api_message(api_client, main.id, "Active prompt")
@@ -149,7 +169,14 @@ async def test_run_rejects_stale_head(api_client, api_gemini):
     assert [item["id"] for item in history.json()] == [first.id]
 
 
-async def test_run_rechecks_head_after_service_validation(api_client, api_gemini, monkeypatch):
+async def test_run_rechecks_head_after_service_validation(
+    api_client: AsyncClient, api_gemini, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Смоделировать смену вершины между проверкой в сервисе и запуском ядра.
+
+    Обёртка над run_turn добавляет новую реплику после проверки исходного
+    expected_head_id. API должен вернуть 409 до обращения к Gemini.
+    """
     _, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "Question")
 
@@ -240,7 +267,14 @@ async def test_regenerate_validates_head_and_preserves_original_branch(api_clien
     assert original.json()[-1]["id"] == run.json()["id"]
 
 
-async def test_regenerate_failure_exposes_fork_for_retry(api_client, api_gemini):
+async def test_regenerate_failure_exposes_fork_for_retry(
+    api_client: AsyncClient, api_gemini,
+) -> None:
+    """Проверить, что сбой Gemini оставляет форк пригодным для повтора.
+
+    После ответа 502 берём ID форка и его вершины из ответа API.
+    Повторяем генерацию для сохранённого вопроса через /run.
+    """
     _, main = await create_api_chat(api_client)
     first = await append_api_message(api_client, main.id, "Question")
     run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={})
