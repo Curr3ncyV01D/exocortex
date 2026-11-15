@@ -17,11 +17,12 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
   const chat = chats.status === 'ready' ? chats.data.find(({ id }) => id === activeChatId) : undefined
   const scrollArea = useRef<HTMLDivElement>(null)
   const head = timeline.status === 'ready' ? timeline.data.at(-1) : undefined
+  const headId = head?.id
 
   useLayoutEffect(() => {
     const area = scrollArea.current
-    if (area && head) area.scrollTop = area.scrollHeight
-  }, [activeBranchId, head])
+    if (area && headId) area.scrollTop = area.scrollHeight
+  }, [activeBranchId, headId])
 
   return (
     <main className="workspace-island flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
@@ -38,7 +39,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           </div>
         </div>
       </header>
-      <div ref={scrollArea} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+      <div ref={scrollArea} data-timeline-scroll className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="conversation-column py-4 md:py-6">
           {chats.status === 'ready' && !chat && (
             <p className="text-sm text-muted">Создайте чат, чтобы открыть его историю.</p>
@@ -56,7 +57,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
           {timeline.status === 'ready' && (
             timeline.data.length > 0
-              ? <MessageTimeline messages={timeline.data} />
+              ? <MessageTimeline messages={timeline.data} branchId={activeBranchId ?? undefined} />
               : <p className="text-sm text-muted">В этой ветке пока нет сообщений.</p>
           )}
         </div>

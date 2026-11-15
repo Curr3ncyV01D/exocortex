@@ -58,6 +58,27 @@ describe('REST API client', () => {
     await expect(failure).rejects.toMatchObject({ status: 404, message: body.detail, body })
   })
 
+  it('uses the edit, mask and fork contracts with their respective IDs', async () => {
+    const message = timeline[0]
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(message))
+      .mockResolvedValueOnce(Response.json({ message_id: message.id, is_active: false }))
+      .mockResolvedValueOnce(Response.json(main, { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.editMessage(message.id, '**текст**', true)
+    await api.toggleMessage(message.id)
+    await api.createBranch(chat.id, message.id, 'feature/notes')
+
+    expect(fetchMock.mock.calls.map(([path, options]) => [
+      path, options.method, options.body && JSON.parse(options.body),
+    ])).toEqual([
+      ['/api/v1/messages/question', 'PATCH', { content: '**текст**', force: true }],
+      ['/api/v1/messages/question/toggle-active', 'POST', undefined],
+      ['/api/v1/chats/chat-1/branches', 'POST', { target_message_id: 'question', name: 'feature/notes' }],
+    ])
+  })
+
   it('reports non-JSON HTTP failures with their status', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('Bad gateway', { status: 502 })))
 

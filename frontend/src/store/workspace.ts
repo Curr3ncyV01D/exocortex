@@ -18,6 +18,7 @@ interface WorkspaceData {
   activeChatId: string | null
   activeBranchId: string | null
   turns: Partial<Record<string, TurnState>>
+  mutatingMessages: ReadonlySet<string>
 }
 
 interface WorkspaceState extends WorkspaceData {
@@ -27,6 +28,9 @@ interface WorkspaceState extends WorkspaceData {
   createChat: (title: string) => Promise<void>
   sendMessage: (branchId: string, content: string, generate: boolean) => Promise<boolean>
   runBranch: (branchId: string, headId: string) => Promise<void>
+  editMessage: (message: MessageResponse, content: string, force: boolean) => Promise<boolean>
+  toggleMessage: (message: MessageResponse) => Promise<boolean>
+  forkBranch: (sourceBranchId: string, message: MessageResponse, name: string) => Promise<void>
   reset: () => void
 }
 
@@ -37,6 +41,7 @@ const initialData: WorkspaceData = {
   activeChatId: null,
   activeBranchId: null,
   turns: {},
+  mutatingMessages: new Set(),
 }
 
 function updateBranchHead(branches: WorkspaceData['branches'], branchId: string, headId: string | null) {
@@ -70,6 +75,37 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
   function refreshIfSelected(branchId: string) {
     if (get().activeBranchId === branchId) void get().selectBranch(branchId)
+  }
+
+  async function mutateMessage(
+    message: MessageResponse,
+    requestUpdate: () => Promise<(current: MessageResponse) => MessageResponse>,
+  ) {
+    const { id, chat_id: chatId } = message
+    if (get().mutatingMessages.has(id)) return false
+    const startedAt = revision
+    set({ mutatingMessages: new Set([...get().mutatingMessages, id]) })
+
+    try {
+      const update = await requestUpdate()
+      if (revision !== startedAt) return false
+      const { activeChatId, activeBranchId, timeline } = get()
+      if (activeChatId === chatId && activeBranchId) {
+        if (timeline.status === 'ready') {
+          // Shared messages may still be visible after changing branches.
+          set({ timeline: { status: 'ready', data: timeline.data.map((row) => row.id === id ? update(row) : row) } })
+        } else if (timeline.status === 'loading') {
+          refreshIfSelected(activeBranchId)
+        }
+      }
+      return true
+    } finally {
+      if (revision === startedAt) {
+        const pending = new Set(get().mutatingMessages)
+        pending.delete(id)
+        set({ mutatingMessages: pending })
+      }
+    }
   }
 
   function recordMessage(branchId: string, message: MessageResponse) {
@@ -204,6 +240,33 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     async runBranch(branchId, headId) {
       if (branchIsBusy(branchId)) return
       await generateReply(branchId, headId, revision)
+    },
+
+    editMessage(message, content, force) {
+      return mutateMessage(message, async () => {
+        const edited = await api.editMessage(message.id, content, force)
+        return (current) => ({
+          ...current, content: edited.content, is_edited: edited.is_edited, updated_at: edited.updated_at,
+        })
+      })
+    },
+
+    toggleMessage(message) {
+      return mutateMessage(message, async () => {
+        const result = await api.toggleMessage(message.id)
+        return (current) => ({ ...current, is_active: result.is_active })
+      })
+    },
+
+    async forkBranch(sourceBranchId, message, name) {
+      const startedAt = revision
+      const branch = await api.createBranch(message.chat_id, message.id, name)
+      const { activeChatId, activeBranchId, branches } = get()
+      if (revision !== startedAt || activeChatId !== message.chat_id || branches.status !== 'ready') return
+      if (!branches.data.some(({ id }) => id === branch.id)) {
+        set({ branches: { status: 'ready', data: [...branches.data, branch] } })
+      }
+      if (activeBranchId === sourceBranchId) void get().selectBranch(branch.id)
     },
 
     reset() {

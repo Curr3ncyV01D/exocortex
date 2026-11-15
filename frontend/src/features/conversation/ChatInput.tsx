@@ -84,7 +84,7 @@ export function ChatInput({ branchId, head, historyReady }: ChatInputProps) {
             </button>
             <button
               type="submit"
-              className="chat-input-run"
+              className="button-primary"
               disabled={!canRun}
               aria-keyshortcuts="Control+Enter"
               title={!hasDraft && headId ? 'Ответить на сохранённый вопрос' : 'Отправить сообщение и получить ответ'}

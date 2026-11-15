@@ -66,7 +66,7 @@
     @apply border-accent/45;
   }
 
-  .chat-input-run {
+  .button-primary {
     @apply rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-canvas hover:bg-accent/90 disabled:opacity-45;
   }
 
@@ -95,6 +95,39 @@
     .message-card:not(:hover, :focus-within) .message-duration {
       visibility: hidden;
     }
+
+    .message-card:not(:hover, :focus-within) .message-toolbar {
+      opacity: 0;
+    }
+  }
+
+  .message-toolbar {
+    @apply relative flex items-center gap-0.5 rounded-lg bg-panel;
+  }
+
+  .message-action {
+    @apply grid size-7 place-items-center rounded-md text-base text-foreground hover:bg-surface disabled:opacity-45;
+  }
+
+  .message-action-menu {
+    @apply absolute top-full right-0 z-10 mt-1 grid w-max max-w-[calc(100vw-4rem)] gap-0.5 rounded-xl border border-line bg-panel p-1 text-sm text-foreground shadow-xl shadow-black/40;
+  }
+
+  .message-action-menu[data-placement="above"] {
+    @apply top-auto bottom-full mt-0 mb-1;
+  }
+
+  .message-action-menu button {
+    @apply rounded-lg px-2.5 py-2 text-left hover:bg-surface disabled:opacity-45;
+  }
+
+  .message-dialog {
+    @apply fixed inset-0 m-auto max-h-[calc(100dvh-2rem)] w-[min(28rem,calc(100vw-2rem))] overflow-auto rounded-2xl border border-white/10 bg-panel p-4 text-foreground;
+    @apply backdrop:bg-black/65;
+  }
+
+  .message-dialog-actions {
+    @apply mt-4 flex flex-wrap justify-end gap-2;
   }
 
   .technical-details {

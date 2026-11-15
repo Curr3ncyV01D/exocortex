@@ -28,3 +28,14 @@ export interface MessageResponse {
   created_at: string
   updated_at: string | null
 }
+
+export interface ToggleActiveResponse {
+  message_id: string
+  is_active: boolean
+}
+
+export interface AncestorMutationWarningResponse {
+  detail: 'ANCESTOR_MUTATION_WARNING'
+  affected_branch_count: number
+  message: string
+}
