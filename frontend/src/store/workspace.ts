@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api, requestErrorMessage } from '../api/client'
+import { api, ApiError, requestErrorMessage } from '../api/client'
 import type { BranchResponse, ChatResponse, MessageResponse } from '../api/types'
 
 type Resource<T> =
@@ -7,12 +7,17 @@ type Resource<T> =
   | { status: 'ready'; data: T }
   | { status: 'error'; message: string }
 
+type TurnState =
+  | { status: 'saving' | 'generating' }
+  | { status: 'error'; message: string; retryHeadId?: string }
+
 interface WorkspaceData {
   chats: Resource<ChatResponse[]>
   branches: Resource<BranchResponse[]>
   timeline: Resource<MessageResponse[]>
   activeChatId: string | null
   activeBranchId: string | null
+  turns: Partial<Record<string, TurnState>>
 }
 
 interface WorkspaceState extends WorkspaceData {
@@ -20,6 +25,8 @@ interface WorkspaceState extends WorkspaceData {
   selectChat: (chatId: string) => Promise<void>
   selectBranch: (branchId: string) => Promise<void>
   createChat: (title: string) => Promise<void>
+  sendMessage: (branchId: string, content: string, generate: boolean) => Promise<boolean>
+  runBranch: (branchId: string, headId: string) => Promise<void>
   reset: () => void
 }
 
@@ -29,6 +36,17 @@ const initialData: WorkspaceData = {
   timeline: { status: 'idle' },
   activeChatId: null,
   activeBranchId: null,
+  turns: {},
+}
+
+function updateBranchHead(branches: WorkspaceData['branches'], branchId: string, headId: string | null) {
+  if (branches.status !== 'ready') return branches
+  return {
+    ...branches,
+    data: branches.data.map((branch) =>
+      branch.id === branchId ? { ...branch, head_message_id: headId } : branch,
+    ),
+  }
 }
 
 export const useWorkspace = create<WorkspaceState>()((set, get) => {
@@ -36,6 +54,61 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
   let branchesRequest: AbortController | undefined
   let timelineRequest: AbortController | undefined
   let createRequest: AbortController | undefined
+  let revision = 0
+
+  function setTurn(branchId: string, turn?: TurnState) {
+    const turns = { ...get().turns }
+    if (turn) turns[branchId] = turn
+    else delete turns[branchId]
+    set({ turns })
+  }
+
+  function branchIsBusy(branchId: string) {
+    const status = get().turns[branchId]?.status
+    return status === 'saving' || status === 'generating'
+  }
+
+  function refreshIfSelected(branchId: string) {
+    if (get().activeBranchId === branchId) void get().selectBranch(branchId)
+  }
+
+  function recordMessage(branchId: string, message: MessageResponse) {
+    const { activeBranchId, timeline, branches } = get()
+    if (activeBranchId !== branchId) return
+
+    if (timeline.status === 'ready') {
+      if (timeline.data.some(({ id }) => id === message.id)) return
+      const headId = timeline.data.at(-1)?.id ?? null
+      if (headId === message.parent_id) {
+        set({
+          timeline: { status: 'ready', data: [...timeline.data, message] },
+          branches: updateBranchHead(branches, branchId, message.id),
+        })
+        return
+      }
+    }
+    refreshIfSelected(branchId)
+  }
+
+  async function generateReply(branchId: string, headId: string, startedAt: number) {
+    setTurn(branchId, { status: 'generating' })
+    try {
+      const reply = await api.runTurn(branchId, headId)
+      if (revision !== startedAt) return
+      recordMessage(branchId, reply)
+      setTurn(branchId)
+    } catch (error) {
+      if (revision !== startedAt) return
+      const status = error instanceof ApiError ? error.status : undefined
+      setTurn(branchId, {
+        status: 'error',
+        message: requestErrorMessage(error, 'Не удалось получить ответ. Вопрос сохранён.'),
+        retryHeadId: status === 502 || status === undefined ? headId : undefined,
+      })
+      // Re-read the head if a conflict or an interrupted response left it uncertain.
+      if (status === 409 || status === undefined) refreshIfSelected(branchId)
+    }
+  }
 
   return {
     ...initialData,
@@ -85,7 +158,10 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
         const messages = await api.getTimeline(branchId, request.signal)
         // The previous request may resolve after its branch has lost focus.
         if (request.signal.aborted) return
-        set({ timeline: { status: 'ready', data: messages } })
+        set({
+          timeline: { status: 'ready', data: messages },
+          branches: updateBranchHead(get().branches, branchId, messages.at(-1)?.id ?? null),
+        })
       } catch (error) {
         if (request.signal.aborted) return
         set({ timeline: { status: 'error', message: requestErrorMessage(error, 'Не удалось загрузить историю.') } })
@@ -101,7 +177,37 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       void get().selectChat(chat.id)
     },
 
+    async sendMessage(branchId, content, generate) {
+      if (branchIsBusy(branchId) || !content.trim()) return false
+      const startedAt = revision
+      setTurn(branchId, { status: 'saving' })
+      let saved: MessageResponse
+      try {
+        saved = await api.sendMessage(branchId, content)
+      } catch (error) {
+        if (revision !== startedAt) return false
+        setTurn(branchId, {
+          status: 'error',
+          message: requestErrorMessage(error, 'Не удалось сохранить реплику. Черновик сохранён.'),
+        })
+        if (error instanceof ApiError && error.status === 409) refreshIfSelected(branchId)
+        return false
+      }
+      if (revision !== startedAt) return true
+
+      recordMessage(branchId, saved)
+      if (generate) void generateReply(branchId, saved.id, startedAt)
+      else setTurn(branchId)
+      return true
+    },
+
+    async runBranch(branchId, headId) {
+      if (branchIsBusy(branchId)) return
+      await generateReply(branchId, headId, revision)
+    },
+
     reset() {
+      revision += 1
       chatsRequest?.abort()
       branchesRequest?.abort()
       timelineRequest?.abort()

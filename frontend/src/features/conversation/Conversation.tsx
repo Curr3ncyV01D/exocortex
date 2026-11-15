@@ -1,7 +1,9 @@
+import { useLayoutEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { LoadError } from '../../components/LoadError'
 import { useWorkspace } from '../../store/workspace'
 import { BranchPicker } from '../branches/BranchPicker'
+import { ChatInput } from './ChatInput'
 import { MessageTimeline } from './MessageTimeline'
 
 export function Conversation({ navigation }: { navigation: ReactNode }) {
@@ -13,6 +15,13 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
   const selectChat = useWorkspace((state) => state.selectChat)
   const selectBranch = useWorkspace((state) => state.selectBranch)
   const chat = chats.status === 'ready' ? chats.data.find(({ id }) => id === activeChatId) : undefined
+  const scrollArea = useRef<HTMLDivElement>(null)
+  const head = timeline.status === 'ready' ? timeline.data.at(-1) : undefined
+
+  useLayoutEffect(() => {
+    const area = scrollArea.current
+    if (area && head) area.scrollTop = area.scrollHeight
+  }, [activeBranchId, head])
 
   return (
     <main className="workspace-island flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
@@ -29,7 +38,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           </div>
         </div>
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+      <div ref={scrollArea} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="conversation-column py-4 md:py-6">
           {chats.status === 'ready' && !chat && (
             <p className="text-sm text-muted">Создайте чат, чтобы открыть его историю.</p>
@@ -52,6 +61,9 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
         </div>
       </div>
+      {activeBranchId && (
+        <ChatInput key={activeBranchId} branchId={activeBranchId} head={head} historyReady={timeline.status === 'ready'} />
+      )}
     </main>
   )
 }

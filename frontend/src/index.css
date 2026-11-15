@@ -56,6 +56,20 @@
     @apply mx-auto w-full max-w-3xl px-3 md:px-6;
   }
 
+  .chat-input-textarea {
+    @apply block min-h-12 w-full resize-y rounded-lg px-2 py-1.5 text-sm leading-relaxed outline-none placeholder:text-muted;
+    max-height: min(28dvh, 11rem);
+    field-sizing: content;
+  }
+
+  .chat-input:focus-within {
+    @apply border-accent/45;
+  }
+
+  .chat-input-run {
+    @apply rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-canvas hover:bg-accent/90 disabled:opacity-45;
+  }
+
   .button-secondary {
     @apply rounded-lg border border-line px-2.5 py-1.5 text-sm font-medium text-foreground;
     @apply hover:bg-surface disabled:opacity-50;

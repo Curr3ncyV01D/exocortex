@@ -34,6 +34,21 @@ describe('REST API client', () => {
     }))
   })
 
+  it('posts user content and passes the saved message id to a separate run request', async () => {
+    const saved = timeline[0]
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(saved, { status: 201 }))
+      .mockResolvedValueOnce(Response.json(timeline[1]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    expect(await api.sendMessage(main.id, saved.content)).toEqual(saved)
+    expect(await api.runTurn(main.id, saved.id)).toEqual(timeline[1])
+    expect(fetchMock.mock.calls.map(([url, options]) => [url, options.method, JSON.parse(options.body)])).toEqual([
+      ['/api/v1/branches/branch-main/messages', 'POST', { content: saved.content }],
+      ['/api/v1/branches/branch-main/run', 'POST', { expected_head_id: saved.id }],
+    ])
+  })
+
   it('keeps the HTTP status and structured error body for callers', async () => {
     const body = { detail: 'Ветка не найдена.' }
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(body, { status: 404 })))

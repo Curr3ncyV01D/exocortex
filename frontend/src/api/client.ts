@@ -28,15 +28,19 @@ async function request<T>(path: string, options: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function post<T>(path: string, body: object, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
 export const api = {
   listChats: (signal?: AbortSignal) => request<ChatResponse[]>('/chats', { signal }),
 
-  createChat: (title: string, signal?: AbortSignal) => request<ChatResponse>('/chats', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title }),
-    signal,
-  }),
+  createChat: (title: string, signal?: AbortSignal) => post<ChatResponse>('/chats', { title }, signal),
 
   listBranches: (chatId: string, signal?: AbortSignal) =>
     request<BranchResponse[]>(`/chats/${encodeURIComponent(chatId)}/branches`, { signal }),
@@ -45,4 +49,10 @@ export const api = {
     request<MessageResponse[]>(
       `/branches/${encodeURIComponent(branchId)}/timeline?include_inactive=true`, { signal },
     ),
+
+  sendMessage: (branchId: string, content: string) =>
+    post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/messages`, { content }),
+
+  runTurn: (branchId: string, expectedHeadId: string) =>
+    post<MessageResponse>(`/branches/${encodeURIComponent(branchId)}/run`, { expected_head_id: expectedHeadId }),
 }
