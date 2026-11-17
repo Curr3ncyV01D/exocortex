@@ -1,4 +1,7 @@
-from sqlalchemy import select
+import json
+from hashlib import sha256
+
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient
@@ -8,16 +11,18 @@ from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
     GraphEngineError,
+    GraphIntegrityError,
     MergeResult,
     MessageNotFoundError,
     branch_from_here,
+    latest_dialogue_message,
     read_context_from_head,
     reserve_branch_write,
     squash_merge_branch,
     toggle_message_active,
     update_message_content,
 )
-from src.storage.models import Branch, Chat, Message, MessageRole
+from src.storage.models import Branch, Chat, Message, MessageRole, MessageSubmission
 
 
 class ChatNotFoundError(GraphEngineError):
@@ -80,31 +85,56 @@ async def create_branch(
         return await branch_from_here(chat_id, target_message_id, name, session)
 
 
-async def get_timeline(session: AsyncSession, branch_id: str) -> list[Message]:
+async def get_timeline(
+    session: AsyncSession, branch_id: str, *, include_inactive: bool = False,
+) -> list[Message]:
     branch = await _require_branch(session, branch_id)
-    return await read_context_from_head(branch.chat_id, branch.head_message_id, session)
+    return await read_context_from_head(
+        branch.chat_id, branch.head_message_id, session, include_inactive=include_inactive,
+    )
 
 
-async def send_message(session: AsyncSession, branch_id: str, content: str) -> Message:
+async def send_message(
+    session: AsyncSession, branch_id: str, content: str, idempotency_key: str | None = None,
+) -> Message:
     async with session.begin():
+        if idempotency_key is not None:
+            # Acquire SQLite's writer slot before looking up the receipt.
+            # A simultaneous retry will then read the committed result.
+            await session.execute(text("BEGIN IMMEDIATE"))
         branch = await _require_branch(session, branch_id)
-        return await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+        if idempotency_key is None:
+            return await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+
+        content_hash = sha256(content.encode("utf-8")).hexdigest()
+        receipt = await session.get(MessageSubmission, (branch_id, idempotency_key))
+        if receipt is not None:
+            if receipt.content_hash != content_hash:
+                raise BranchConflictError("Этот ключ отправки уже использован для другого текста.")
+            message = await session.get(Message, receipt.message_id)
+            if message is None or message.chat_id != branch.chat_id:
+                raise GraphIntegrityError("Запись об отправке не соответствует сохранённой реплике.")
+            return message
+
+        message = await append_message(branch.chat_id, branch.name, MessageRole.USER, content, session)
+        session.add(MessageSubmission(
+            branch_id=branch_id, key=idempotency_key, content_hash=content_hash, message_id=message.id,
+        ))
+        return message
 
 
 async def generate_reply(
     session: AsyncSession, client: GeminiClient, branch_id: str, expected_head_id: str | None,
+    expected_question_id: str | None = None,
 ) -> Message:
     async with session.begin():
         branch = await _require_branch(session, branch_id)
         chat_id, name, head_id = branch.chat_id, branch.name, branch.head_message_id
         if expected_head_id is not None and head_id != expected_head_id:
             raise BranchConflictError("Состояние ветки изменилось. Повторите операцию.")
-        head = await session.get(Message, head_id) if head_id is not None else None
-        if head is None or head.role != MessageRole.USER or not head.is_active:
-            raise BranchConflictError("На вершине ветки нет активной реплики пользователя.")
-
-    # Даже без клиентского ID привязываем генерацию к проверенному вопросу.
-    return await run_turn(chat_id, name, client, session, expected_head_id=head_id)
+    return await run_turn(
+        chat_id, name, client, session, expected_head_id=head_id, expected_question_id=expected_question_id,
+    )
 
 
 async def regenerate_reply(
@@ -119,22 +149,26 @@ async def regenerate_reply(
         if source.head_message_id != expected_head_id:
             raise BranchConflictError("Состояние ветки изменилось. Повторите операцию.")
         await reserve_branch_write(session, source.id, expected_head_id, source.last_merged_message_id)
-        head = await session.get(Message, expected_head_id)
-        parent = (
-            await session.get(Message, head.parent_id)
-            if head is not None and head.parent_id is not None else None
-        )
-        if (
-            head is None or head.role != MessageRole.MODEL or parent is None
-            or parent.role != MessageRole.USER or not parent.is_active
-        ):
-            raise BranchConflictError("Для перегенерации нужен ответ модели на активную реплику пользователя.")
-        chat_id, question_id = source.chat_id, parent.id
+        history = await read_context_from_head(source.chat_id, source.head_message_id, session, include_inactive=True)
+        answer = latest_dialogue_message(history)
+        if answer is None or answer.role != MessageRole.MODEL:
+            raise BranchConflictError("Для перегенерации нужен последний активный ответ модели.")
+        metadata = json.loads(answer.metadata_json or "{}") or {}
+        question_id = metadata.get("reply_to_message_id", answer.parent_id)
+        question = next((msg for msg in history[:history.index(answer)] if msg.id == question_id), None)
+        if question is None or question.role != MessageRole.USER:
+            raise BranchConflictError("Не найден исходный вопрос для перегенерации.")
+        if not question.is_active:
+            raise BranchConflictError("Исходный вопрос скрыт. Верните его в контекст для перегенерации.")
+        chat_id, question_id = source.chat_id, question.id
         fork = await branch_from_here(chat_id, question_id, new_branch_name, session)
         fork_id = fork.id
 
     try:
-        answer = await run_turn(chat_id, new_branch_name, client, session, expected_head_id=question_id)
+        answer = await run_turn(
+            chat_id, new_branch_name, client, session,
+            expected_head_id=question_id, expected_question_id=question_id,
+        )
     except LLMGenerationError as exc:
         raise RegenerationFailedError(fork_id, question_id, exc) from exc
     return await _require_branch(session, fork_id), answer

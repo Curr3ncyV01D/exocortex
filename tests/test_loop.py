@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -14,7 +15,10 @@ from src.agent.client import GeminiClient, map_messages_to_gemini
 from src.agent.loop import BranchBusyError, LLMGenerationError, PromptTooLargeError, run_turn
 from src.config import settings
 from src.storage.crud.chats import append_message
-from src.storage.crud.graph import BranchConflictError, branch_from_here, squash_merge_branch
+from src.storage.crud.graph import (
+    BranchConflictError, branch_from_here, squash_merge_branch,
+    toggle_message_active, update_message_content,
+)
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
 
@@ -124,6 +128,39 @@ async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_f
 
 def _contents_size(contents: list[types.Content]) -> int:
     return sum(len(item.model_dump_json().encode("utf-8")) for item in contents)
+
+
+@pytest.mark.asyncio
+async def test_turn_keeps_a_snapshot_for_context_and_memory_tools(file_sessions):
+    """Правка и маска между вызовами Gemini не меняют уже начатый ход."""
+    async with file_sessions() as writer:
+        setup = await create_initial_chat(writer)
+        chat_id, question_id = setup["chat_id"], setup["root_message_id"]
+        await branch_from_here(chat_id, question_id, "side", writer)
+        archive = await append_message(chat_id, "side", MessageRole.USER, "ArchiveMarker", writer)
+        archive_id = archive.id
+        await writer.commit()
+
+    requests = []
+
+    async def generate(*, contents, tools):
+        requests.append([item.model_copy(deep=True) for item in contents])
+        if len(requests) == 1:
+            async with file_sessions.begin() as writer:
+                await update_message_content(question_id, "Edited later", force=True, session=writer)
+                await toggle_message_active(archive_id, writer)
+            return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
+        return _make_text_response("Reply")
+
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=generate)
+        async with file_sessions() as session:
+            await run_turn(chat_id, "main", client, session, expected_question_id=question_id)
+
+    assert all("Edited later" not in item.model_dump_json() for item in requests[1])
+    result = requests[1][-1].parts[0].function_response
+    assert "ArchiveMarker" in result.response["result"]
 
 
 @pytest.mark.asyncio
@@ -248,9 +285,14 @@ async def test_run_turn_direct_response_happy_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("search_args", [
+    {"query": "FastAPI"},
+    {"query": "", "date_from": "2026-05-01", "date_to": "2026-05-31"},
+])
 async def test_run_turn_with_tool_call_and_real_fts_search(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
+    search_args: dict[str, str],
 ) -> None:
     """Проверка полного цикла ReAct: вызов search_history, чтение БД и трассировка."""
     chat_id = initial_chat_setup["chat_id"]
@@ -262,20 +304,21 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
         new_branch_name="archive-branch",
         session=session,
     )
-    await append_message(
+    archived = await append_message(
         chat_id=chat_id,
         branch_name="archive-branch",
         role=MessageRole.USER,
         content="Исторический факт: проект написан на FastAPI.",
         session=session,
     )
+    archived.created_at = datetime(2026, 5, 16, 14, 44, tzinfo=timezone.utc)
     await session.commit()
 
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
         client.generate_step = AsyncMock(
             side_effect=[
-                _make_tool_call_response([("search_history", {"query": "FastAPI"})]),
+                _make_tool_call_response([("search_history", search_args)]),
                 _make_text_response("Нашел в истории: проект написан на FastAPI."),
             ]
         )
@@ -291,15 +334,60 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
     assert client.generate_step.await_count == 2
     assert "FastAPI" in model_msg.content
 
+    search_tool = client.generate_step.await_args_list[0].kwargs["tools"][0]
+    declaration = types.FunctionDeclaration.from_callable_with_api_option(callable=search_tool)
+    assert declaration.parameters is not None
+    properties = declaration.parameters.properties or {}
+    assert set(properties) == {"query", "limit", "date_from", "date_to"}
+    assert properties["date_from"].type == properties["date_to"].type == types.Type.STRING
+    assert declaration.parameters.required == ["query"]
+
     meta = json.loads(model_msg.metadata_json or "{}")
     trace = meta["execution_trace"]
     assert trace["iterations_used"] == 1
     assert len(trace["steps"]) == 1
     assert trace["steps"][0]["tool_called"] == "search_history"
-    assert trace["steps"][0]["arguments"] == {"query": "FastAPI"}
+    assert trace["steps"][0]["arguments"] == search_args
+    assert f"[ID: {archived.id}] [2026-05-16 14:44]" in trace["steps"][0]["output_summary"]
     assert "FastAPI" in trace["steps"][0]["output_summary"]
     history = client.generate_step.await_args_list[1].kwargs["contents"]
     assert history[-1].parts[0].function_response.id == "call-0"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_registers_and_invokes_memory_navigation_tools(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Gemini can navigate the current chat without choosing a chat or branch ID."""
+    chat_id = initial_chat_setup["chat_id"]
+    anchor_id = initial_chat_setup["root_message_id"]
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([
+                ("get_chat_overview", {}),
+                ("read_context_around", {"message_id": anchor_id, "radius": 1}),
+            ]),
+            _make_text_response("Нашёл исходный вопрос."),
+        ])
+        result = await run_turn(chat_id, "main", client, session, user_prompt="Текущий вопрос")
+
+    declarations = {
+        tool.__name__: types.FunctionDeclaration.from_callable_with_api_option(callable=tool)
+        for tool in client.generate_step.await_args_list[0].kwargs["tools"]
+    }
+    assert declarations.keys() == {"search_history", "get_summary", "get_chat_overview", "read_context_around"}
+    overview = declarations["get_chat_overview"].parameters
+    assert overview is None or not overview.properties
+    context = declarations["read_context_around"].parameters
+    assert context is not None
+    assert set(context.properties or {}) == {"message_id", "radius"}
+    assert context.required == ["message_id"]
+
+    steps = json.loads(result.metadata_json or "{}")["execution_trace"]["steps"]
+    assert "Активных сообщений: 2" in steps[0]["output_summary"]
+    assert f"[ID: {anchor_id}]" in steps[1]["output_summary"]
+    assert "Текущий вопрос" in steps[1]["output_summary"]
 
 
 @pytest.mark.asyncio
@@ -310,7 +398,8 @@ async def test_run_turn_excludes_every_context_node_from_search(
     chat_id = initial_chat_setup["chat_id"]
     first = await append_message(chat_id, "main", MessageRole.MODEL, "Archive first", session)
     second = await append_message(chat_id, "main", MessageRole.MODEL, "Archive second", session)
-    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id]
+    pending = await append_message(chat_id, "main", MessageRole.USER, "Pending question", session)
+    expected_ids = [initial_chat_setup["root_message_id"], first.id, second.id, pending.id]
     await session.commit()
 
     with patch("src.agent.client.genai.Client"), patch(

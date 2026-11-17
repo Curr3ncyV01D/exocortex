@@ -8,7 +8,8 @@ from pydantic import AfterValidator, AliasChoices, BaseModel, ConfigDict, Field,
 
 
 BranchName = Annotated[
-    str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$"),
+    str,
+    Field(min_length=1, max_length=64, pattern=r"^[A-Za-zА-Яа-яЁё0-9_-]+(?:(?: +|/)[A-Za-zА-Яа-яЁё0-9_-]+)*$"),
 ]
 
 
@@ -92,6 +93,7 @@ class SendMessageRequest(BaseModel):
 
 class RunTurnRequest(BaseModel):
     expected_head_id: str | None = None
+    expected_question_id: str | None = None
 
 
 class MessageUpdateContentRequest(SendMessageRequest):

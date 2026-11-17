@@ -26,6 +26,7 @@ htmlcov/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.bak_*
 data/raw/*
 !data/raw/.gitkeep
 !data/.gitkeep

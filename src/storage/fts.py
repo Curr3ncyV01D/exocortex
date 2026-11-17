@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from itertools import islice
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,10 @@ class SearchHit:
     role: MessageRole
     content: str
     created_at: datetime
+
+
+class InvalidSearchDateError(ValueError):
+    """Дата поиска не соответствует формату или диапазон перевёрнут."""
 
 
 class FTSQueryBuilder:
@@ -36,12 +41,9 @@ class FTSQueryBuilder:
         return stemmed if len(stemmed) >= 2 else word
 
     @classmethod
-    def build(cls, raw_query: str) -> str:
-        """Преобразует пользовательский запрос в безопасный поисковый терм FTS5."""
+    def build_terms(cls, raw_query: str) -> list[str]:
+        """Преобразует слова запроса в безопасные термы FTS5."""
         tokens = re.findall(r"[^\W_]+", raw_query)
-        if not tokens:
-            return ""
-
         processed_parts: list[str] = []
         for token in tokens:
             upper_token = token.upper()
@@ -51,7 +53,19 @@ class FTSQueryBuilder:
                 base = cls.stem_word(token)
                 processed_parts.append(f'"{base}"*')
 
-        return " ".join(processed_parts)
+        return processed_parts
+
+
+def _parse_search_date(value: str | None, parameter: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidSearchDateError(f"{parameter} должна быть датой в формате YYYY-MM-DD (UTC).") from exc
+    if parsed.isoformat() != value:
+        raise InvalidSearchDateError(f"{parameter} должна быть датой в формате YYYY-MM-DD (UTC).")
+    return parsed
 
 
 async def query_messages_fts(
@@ -60,44 +74,60 @@ async def query_messages_fts(
     exclude_ids: set[str],
     session: AsyncSession,
     limit: int = 5,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> list[SearchHit]:
-    """Выполняет полнотекстовый поиск по индексу messages_fts с фильтрацией активного контекста."""
+    """Ищет активные реплики чата по термам FTS5 и/или диапазону дат UTC."""
     if limit <= 0:
         return []
     limit = min(limit, MAX_SEARCH_RESULTS)
-    sanitized_query = FTSQueryBuilder.build(raw_query)
-    if not sanitized_query:
+    start = _parse_search_date(date_from, "date_from")
+    end = _parse_search_date(date_to, "date_to")
+    if start is not None and end is not None and start > end:
+        raise InvalidSearchDateError("date_from должна быть не позднее date_to.")
+
+    terms = FTSQueryBuilder.build_terms(raw_query)
+    if not terms and (raw_query.strip() or (start is None and end is None)):
         return []
 
-    fetch_limit = limit + len(exclude_ids)
+    filters = ["m.chat_id = :chat_id", "m.is_active = 1"]
+    params: dict[str, str | int] = {"chat_id": chat_id, "fetch_limit": limit + len(exclude_ids)}
+    if start is not None:
+        filters.append("m.created_at >= :date_from")
+        params["date_from"] = start.isoformat()
+    if end is not None and end < date.max:
+        filters.append("m.created_at < :date_before")
+        params["date_before"] = (end + timedelta(days=1)).isoformat()
 
-    stmt = text("""
+    source = "messages m"
+    order = "m.created_at, m.rowid"
+    if terms:
+        source = "messages_fts JOIN messages m ON messages_fts.rowid = m.rowid"
+        filters.append("messages_fts MATCH :query")
+        order = "rank, m.id"
+
+    # SQL fragments are fixed above. All search inputs are bound parameters.
+    stmt = text(f"""
         SELECT m.id, m.role, m.content, m.created_at
-        FROM messages_fts f
-        JOIN messages m ON f.rowid = m.rowid
-        WHERE messages_fts MATCH :query
-          AND m.chat_id = :chat_id
-          AND m.is_active = 1
-        ORDER BY rank, m.id
+        FROM {source}
+        WHERE {" AND ".join(filters)}
+        ORDER BY {order}
         LIMIT :fetch_limit
     """).columns(Message.id, Message.role, Message.content, Message.created_at)
 
-    result = await session.execute(
-        stmt,
-        {
-            "query": sanitized_query,
-            "chat_id": chat_id,
-            "fetch_limit": fetch_limit,
-        },
-    )
-    rows = result.fetchall()
-
-    filtered_rows: list[SearchHit] = []
-    for row in rows:
-        if row.id in exclude_ids:
-            continue
-        filtered_rows.append(SearchHit(row.id, row.role, row.content, row.created_at))
-        if len(filtered_rows) >= limit:
-            break
-
-    return filtered_rows
+    queries = [" ".join(terms)]
+    if len(terms) > 1:
+        queries.append(" OR ".join(terms))
+    for query in queries:
+        if query:
+            params["query"] = query
+        rows = await session.execute(stmt, params)
+        hits = (
+            SearchHit(row.id, row.role, row.content, row.created_at)
+            for row in rows if row.id not in exclude_ids
+        )
+        filtered = list(islice(hits, limit))
+        if filtered:
+            return filtered
+    return []

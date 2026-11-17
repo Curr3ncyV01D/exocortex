@@ -1,0 +1,224 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: #0b0b0c;
+  --color-panel: #161718;
+  --color-surface: #222427;
+  --color-line: #ffffff2b;
+  --color-scroll-thumb: #656a72;
+  --color-muted: #b0b6be;
+  --color-foreground: #eceef1;
+  --color-accent: #aac7ff;
+}
+
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-scroll-thumb) transparent;
+  }
+
+  body {
+    @apply bg-canvas text-foreground antialiased;
+    color-scheme: dark;
+  }
+
+  :where(button, input, select, a, summary):focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent;
+  }
+}
+
+@layer components {
+  .workspace-island {
+    @apply rounded-2xl border border-white/10 bg-panel;
+  }
+
+  dialog.workspace-island > aside {
+    border: 0;
+  }
+
+  .workspace-separator {
+    @apply relative outline-none;
+  }
+
+  .workspace-separator::after {
+    content: "";
+    @apply pointer-events-none absolute rounded-full bg-transparent;
+  }
+
+  .workspace-separator[aria-orientation="vertical"]::after {
+    @apply inset-y-3 left-1/2 w-0.5 -translate-x-1/2;
+  }
+
+  .workspace-separator[aria-orientation="horizontal"]::after {
+    @apply inset-x-3 top-1/2 h-0.5 -translate-y-1/2;
+  }
+
+  .workspace-separator:is(:hover, :focus-visible, [data-separator="active"], [data-resizing])::after {
+    @apply bg-accent/65;
+  }
+
+  .conversation-column {
+    @apply mx-auto w-full max-w-3xl px-3 md:px-6;
+  }
+
+  .chat-input-textarea {
+    @apply block min-h-12 w-full resize-none overflow-y-auto rounded-lg px-2 py-1.5 text-sm leading-relaxed outline-none placeholder:text-muted;
+    max-height: min(28dvh, 11rem);
+    field-sizing: content;
+  }
+
+  .chat-input-textarea[data-manual-size] {
+    max-height: max(3rem, 40dvh);
+    field-sizing: fixed;
+  }
+
+  .chat-input:focus-within {
+    @apply border-accent/45;
+  }
+
+  .button-primary {
+    @apply rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-canvas hover:bg-accent/90 disabled:opacity-45;
+  }
+
+  .button-secondary {
+    @apply rounded-lg border border-line px-2.5 py-1.5 text-sm font-medium text-foreground;
+    @apply hover:bg-surface disabled:opacity-50;
+  }
+
+  .field {
+    @apply rounded-lg border border-line bg-panel px-2.5 py-1.5 text-sm text-foreground;
+  }
+
+  .message-card {
+    @apply min-w-0 rounded-xl border border-transparent px-3 py-3 md:px-4;
+  }
+
+  .message-card:is([data-role="user"], [data-role="model"]):is(:hover, :focus-visible, :focus-within) {
+    @apply border-line;
+  }
+
+  .message-card[data-active="false"] {
+    @apply border-dashed border-line bg-canvas/35 text-muted;
+  }
+
+  @media (hover: hover) {
+    .message-card:not(:hover, :focus-within) .message-duration {
+      visibility: hidden;
+    }
+
+    .message-card:not(:hover, :focus-within) .message-toolbar {
+      opacity: 0;
+    }
+  }
+
+  .message-toolbar {
+    @apply relative flex items-center gap-0.5 rounded-lg bg-panel;
+  }
+
+  .message-action {
+    @apply grid size-7 place-items-center rounded-md text-base text-foreground hover:bg-surface disabled:opacity-45;
+  }
+
+  .message-action-menu {
+    @apply absolute top-full right-0 z-10 mt-1 grid w-max max-w-[calc(100vw-4rem)] gap-0.5 rounded-xl border border-line bg-panel p-1 text-sm text-foreground shadow-xl shadow-black/40;
+  }
+
+  .message-action-menu[data-placement="above"] {
+    @apply top-auto bottom-full mt-0 mb-1;
+  }
+
+  .message-action-menu button {
+    @apply rounded-lg px-2.5 py-2 text-left hover:bg-surface disabled:opacity-45;
+  }
+
+  .message-dialog {
+    @apply fixed inset-0 m-auto max-h-[calc(100dvh-2rem)] w-[min(28rem,calc(100vw-2rem))] overflow-auto rounded-2xl border border-white/10 bg-panel p-4 text-foreground;
+    @apply backdrop:bg-black/65;
+  }
+
+  .message-dialog-actions {
+    @apply mt-4 flex flex-wrap justify-end gap-2;
+  }
+
+  .technical-details {
+    @apply rounded-xl border border-line text-sm;
+  }
+
+  .technical-details:has(+ .message-markdown) {
+    @apply mb-3;
+  }
+
+  .technical-details summary {
+    @apply flex cursor-pointer list-none items-center justify-between gap-3 rounded-xl px-3 py-2.5 font-medium;
+  }
+
+  .technical-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .technical-details summary::after {
+    content: "";
+    @apply mr-1 size-2 shrink-0 rotate-45 border-r border-b border-current text-muted;
+  }
+
+  .technical-details[open] summary::after {
+    @apply rotate-225;
+  }
+
+  .technical-body {
+    @apply border-t border-line px-3 py-3;
+  }
+
+  .message-markdown {
+    @apply text-sm leading-relaxed wrap-anywhere md:text-base;
+
+    > * + * {
+      @apply mt-3;
+    }
+
+    :where(h1, h2, h3, h4, h5, h6) {
+      @apply font-semibold;
+    }
+
+    :where(h1, h2) {
+      @apply text-lg;
+    }
+
+    a {
+      @apply text-accent underline underline-offset-2;
+    }
+
+    ul {
+      @apply list-disc pl-6;
+    }
+
+    ol {
+      @apply list-decimal pl-6;
+    }
+
+    blockquote {
+      @apply border-l-2 border-line pl-3 text-muted;
+    }
+
+    pre {
+      @apply overflow-x-auto rounded-lg border border-line bg-canvas p-3 text-sm;
+    }
+
+    :not(pre) > code {
+      @apply rounded bg-canvas px-1 font-mono text-sm;
+    }
+
+    table {
+      @apply block max-w-full overflow-x-auto;
+    }
+
+    :where(th, td) {
+      @apply border border-line px-3 py-1.5 text-left;
+    }
+
+    img {
+      @apply max-w-full rounded-lg;
+    }
+  }
+}

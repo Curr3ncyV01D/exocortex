@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from typing import Annotated
+
+from fastapi import APIRouter, Query
 
 from src import services
 from src.api.deps import GeminiDep, SessionDep
@@ -32,8 +34,12 @@ async def create_branch(chat_id: str, payload: BranchCreateRequest, session: Ses
 
 
 @router.get("/branches/{branch_id}/timeline", response_model=list[MessageResponse])
-async def get_timeline(branch_id: str, session: SessionDep):
-    return await services.get_timeline(session, branch_id)
+async def get_timeline(
+    branch_id: str,
+    session: SessionDep,
+    include_inactive: Annotated[bool, Query(description="Включить скрытые из контекста сообщения")] = False,
+):
+    return await services.get_timeline(session, branch_id, include_inactive=include_inactive)
 
 
 @router.post(
@@ -51,7 +57,9 @@ async def merge_branch(
     responses={code: {"model": ErrorResponse} for code in (409, 413, 502)},
 )
 async def run_branch(branch_id: str, payload: RunTurnRequest, session: SessionDep, client: GeminiDep):
-    return await services.generate_reply(session, client, branch_id, payload.expected_head_id)
+    return await services.generate_reply(
+        session, client, branch_id, payload.expected_head_id, payload.expected_question_id,
+    )
 
 
 @router.post(

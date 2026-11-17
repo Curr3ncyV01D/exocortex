@@ -78,13 +78,16 @@ async def get_branch(
     )
 
 
+LATEST_MERGE_EVENT_ORDER = (MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+
+
 async def get_latest_merge_event(
     chat_id: str, branch_name: str, session: AsyncSession,
 ) -> Optional[MergeEvent]:
     return await session.scalar(
         select(MergeEvent)
         .where(MergeEvent.chat_id == chat_id, MergeEvent.source_branch_name == branch_name)
-        .order_by(MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+        .order_by(*LATEST_MERGE_EVENT_ORDER)
         .execution_options(populate_existing=True)
         .limit(1)
     )
@@ -128,11 +131,18 @@ async def reconstruct_context(
 
 
 async def read_context_from_head(
-    chat_id: str, head_id: str | None, session: AsyncSession,
+    chat_id: str, head_id: str | None, session: AsyncSession, *, include_inactive: bool = False,
 ) -> list[Message]:
-    """Читает активные узлы от заданной вершины."""
+    """Читает цепочку от заданной вершины в хронологическом порядке."""
     history = await _read_history(chat_id, head_id, session)
-    return [msg for msg in reversed(history) if msg.is_active]
+    return [msg for msg in reversed(history) if include_inactive or msg.is_active]
+
+
+def latest_dialogue_message(history: list[Message]) -> Message | None:
+    return next(
+        (msg for msg in reversed(history) if msg.is_active and msg.role in (MessageRole.USER, MessageRole.MODEL)),
+        None,
+    )
 
 
 async def _read_history(

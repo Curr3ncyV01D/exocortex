@@ -202,6 +202,17 @@ class ModelMessage(Message):
     }
 
 
+class MessageSubmission(Base):
+    """Связывает повторяемый запрос с сохранённой репликой."""
+
+    __tablename__ = "message_submissions"
+
+    branch_id: Mapped[str] = mapped_column(ForeignKey("branches.id", ondelete="CASCADE"), primary_key=True)
+    key: Mapped[str] = mapped_column(String(36), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
+
+
 class MergeEvent(Message):
     """Полиморфное расширение узла для фиксации факта слияния веток."""
 
