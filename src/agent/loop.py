@@ -243,14 +243,19 @@ async def _generate_from_snapshot(
         except Exception as exc:
             raise LLMGenerationError("Сбой вызова Gemini.") from exc
 
-    async def search_history(query: str, limit: int = 5) -> str:
-        """Выполняет поиск по историческим сообщениям текущего чата."""
+    async def search_history(
+        query: str, limit: int = 5,
+        date_from: str | None = None, date_to: str | None = None,
+    ) -> str:
+        """Ищет историю чата. Даты YYYY-MM-DD (UTC) включительны. query="" ищет только по датам."""
         return await search_history_fts(
             chat_id=chat_id,
             query=query,
             exclude_message_ids=active_ids,
             session=snapshot,
             limit=limit,
+            date_from=date_from,
+            date_to=date_to,
         )
 
     async def get_summary(branch_name: str) -> str:

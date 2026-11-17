@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -284,9 +285,14 @@ async def test_run_turn_direct_response_happy_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("search_args", [
+    {"query": "FastAPI"},
+    {"query": "", "date_from": "2026-05-01", "date_to": "2026-05-31"},
+])
 async def test_run_turn_with_tool_call_and_real_fts_search(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
+    search_args: dict[str, str],
 ) -> None:
     """Проверка полного цикла ReAct: вызов search_history, чтение БД и трассировка."""
     chat_id = initial_chat_setup["chat_id"]
@@ -298,20 +304,21 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
         new_branch_name="archive-branch",
         session=session,
     )
-    await append_message(
+    archived = await append_message(
         chat_id=chat_id,
         branch_name="archive-branch",
         role=MessageRole.USER,
         content="Исторический факт: проект написан на FastAPI.",
         session=session,
     )
+    archived.created_at = datetime(2026, 5, 16, 14, 44, tzinfo=timezone.utc)
     await session.commit()
 
     with patch("src.agent.client.genai.Client"):
         client = GeminiClient(api_key="test-key")
         client.generate_step = AsyncMock(
             side_effect=[
-                _make_tool_call_response([("search_history", {"query": "FastAPI"})]),
+                _make_tool_call_response([("search_history", search_args)]),
                 _make_text_response("Нашел в истории: проект написан на FastAPI."),
             ]
         )
@@ -327,12 +334,21 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
     assert client.generate_step.await_count == 2
     assert "FastAPI" in model_msg.content
 
+    search_tool = client.generate_step.await_args_list[0].kwargs["tools"][0]
+    declaration = types.FunctionDeclaration.from_callable_with_api_option(callable=search_tool)
+    assert declaration.parameters is not None
+    properties = declaration.parameters.properties or {}
+    assert set(properties) == {"query", "limit", "date_from", "date_to"}
+    assert properties["date_from"].type == properties["date_to"].type == types.Type.STRING
+    assert declaration.parameters.required == ["query"]
+
     meta = json.loads(model_msg.metadata_json or "{}")
     trace = meta["execution_trace"]
     assert trace["iterations_used"] == 1
     assert len(trace["steps"]) == 1
     assert trace["steps"][0]["tool_called"] == "search_history"
-    assert trace["steps"][0]["arguments"] == {"query": "FastAPI"}
+    assert trace["steps"][0]["arguments"] == search_args
+    assert f"[ID: {archived.id}] [2026-05-16 14:44]" in trace["steps"][0]["output_summary"]
     assert "FastAPI" in trace["steps"][0]["output_summary"]
     history = client.generate_step.await_args_list[1].kwargs["contents"]
     assert history[-1].parts[0].function_response.id == "call-0"

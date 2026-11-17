@@ -3,7 +3,7 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.storage.crud.graph import get_latest_merge_event
-from src.storage.fts import query_messages_fts
+from src.storage.fts import InvalidSearchDateError, query_messages_fts
 
 
 async def search_history_fts(
@@ -13,16 +13,23 @@ async def search_history_fts(
     *,
     session: AsyncSession,
     limit: int = 5,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> str:
-    """Фасад полнотекстового поиска по истории диалога с усечением сниппетов."""
+    """Форматирует результаты поиска истории по тексту и датам."""
     excluded_ids = set(exclude_message_ids or [])
-    rows = await query_messages_fts(
-        chat_id=chat_id,
-        raw_query=query,
-        exclude_ids=excluded_ids,
-        session=session,
-        limit=limit,
-    )
+    try:
+        rows = await query_messages_fts(
+            chat_id=chat_id,
+            raw_query=query,
+            exclude_ids=excluded_ids,
+            session=session,
+            limit=limit,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except InvalidSearchDateError as error:
+        return f"Ошибка поиска: {error}"
 
     if not rows:
         return "Ничего не найдено."
@@ -34,7 +41,7 @@ async def search_history_fts(
             content = content[:800] + " [...]"
 
         created_str = row.created_at.strftime("%Y-%m-%d %H:%M")
-        snippets.append(f"[{created_str}] {row.role.value}: {content}")
+        snippets.append(f"[ID: {row.id}] [{created_str}] {row.role.value}: {content}")
 
     return "\n---\n".join(snippets)
 
