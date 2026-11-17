@@ -1,5 +1,7 @@
 # ExoCortex Frontend
 
+Для запуска готового интерфейса и API через Compose используй [инструкцию Docker](../docs/how-to/run-with-docker.md).
+
 ## Локальный запуск
 
 Понадобятся Node.js 24 LTS, npm и установленное Python-окружение проекта.

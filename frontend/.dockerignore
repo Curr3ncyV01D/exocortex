@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!index.html
+!nginx.conf
+!package*.json
+!tsconfig*.json
+!vite.config.ts
+!playwright.config.ts
+!e2e/
+!e2e/**
+!src/
+!src/**
+!tests/
+!tests/**
+**/.env*
