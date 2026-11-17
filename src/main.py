@@ -18,13 +18,14 @@ from src.storage.crud.graph import (
     MessageNotFoundError,
     NoActiveMessagesToMergeError,
 )
-from src.storage.database import engine, init_db
+from src.storage.database import engine
+from src.storage.migrations import require_current_schema
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
-        await init_db(engine)
+        await require_current_schema(engine)
         yield
     finally:
         await engine.dispose()

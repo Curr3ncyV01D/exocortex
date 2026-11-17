@@ -22,34 +22,6 @@ engine = create_async_engine(
     echo=False,
 )
 
-FTS_STATEMENTS = (
-    """
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-        content,
-        content='messages',
-        content_rowid='rowid',
-        tokenize='unicode61 remove_diacritics 2'
-    );
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
-    END;
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-    END;
-    """,
-    """
-    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF content ON messages BEGIN
-        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-        INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
-    END;
-    """,
-)
-
-
 @event.listens_for(engine.sync_engine, "connect")
 def configure_sqlite_pragmas(dbapi_connection, connection_record) -> None:
     cursor = dbapi_connection.cursor()
@@ -70,26 +42,6 @@ async_session_factory = async_sessionmaker(
 
 class Base(AsyncAttrs, DeclarativeBase):
     pass
-
-
-async def init_db(target_engine: AsyncEngine = engine) -> None:
-    """Инициализирует реляционные таблицы и виртуальный полнотекстовый индекс FTS5 с триггерами."""
-    import src.storage.models  # Регистрирует таблицы в Base.metadata.
-
-    async with target_engine.begin() as conn:
-        await conn.exec_driver_sql("BEGIN IMMEDIATE")
-        await conn.run_sync(Base.metadata.create_all)
-        objects = await conn.exec_driver_sql(
-            "SELECT name FROM sqlite_master WHERE name IN "
-            "('messages_fts', 'messages_ai', 'messages_ad', 'messages_au')"
-        )
-        needs_rebuild = len(objects.all()) != 4
-        for statement in FTS_STATEMENTS:
-            await conn.exec_driver_sql(statement)
-        if needs_rebuild:
-            await conn.exec_driver_sql(
-                "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')"
-            )
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:

@@ -3,7 +3,7 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
 # --- Database & Async ORM ---
-sqlalchemy>=2.0.36
+sqlalchemy[asyncio]>=2.0.36
 aiosqlite>=0.20.0
 alembic>=1.14.0
 

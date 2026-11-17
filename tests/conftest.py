@@ -19,7 +19,8 @@ from sqlalchemy.pool import StaticPool
 
 from src.agent.client import GeminiClient
 from src.schemas import BranchResponse, ChatResponse, MessageResponse
-from src.storage.database import Base, configure_sqlite_pragmas, init_db
+from src.storage.database import configure_sqlite_pragmas
+from src.storage.migrations import upgrade_schema
 from src.storage.models import Branch, Chat, Message, MessageRole
 
 
@@ -39,14 +40,11 @@ async def async_engine() -> AsyncGenerator[AsyncEngine, None]:
         cursor.execute("PRAGMA foreign_keys = ON;")
         cursor.close()
 
-    await init_db(engine)
-
-    yield engine
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-    await engine.dispose()
+    try:
+        await upgrade_schema(engine)
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 @pytest_asyncio.fixture
@@ -57,7 +55,7 @@ async def file_sessions(
     engine = create_async_engine(url)
     event.listen(engine.sync_engine, "connect", configure_sqlite_pragmas)
     try:
-        await init_db(engine)
+        await upgrade_schema(engine)
         yield async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     finally:
         await engine.dispose()

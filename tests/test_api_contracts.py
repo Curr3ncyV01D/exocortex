@@ -341,18 +341,25 @@ async def test_run_keeps_pending_question_after_merge(api_client, api_gemini, mo
     assert hidden.content not in sent
 
 
-async def test_lifespan_initializes_sqlite_and_cors(monkeypatch):
+async def test_lifespan_requires_migrated_sqlite_and_serves_cors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The app checks the revision and serves the existing API after Alembic runs."""
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from src import main
     from src.storage import database
+    from src.storage.migrations import upgrade_schema
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(main, "engine", engine)
     monkeypatch.setattr(database, "async_session_factory", async_sessionmaker(
         engine, expire_on_commit=False, autoflush=False,
     ))
+    with pytest.raises(RuntimeError, match="alembic upgrade head"):
+        async with main.app.router.lifespan_context(main.app):
+            pytest.fail("An unversioned database must prevent application startup.")
+
+    await upgrade_schema(engine)
     async with main.app.router.lifespan_context(main.app):
         async with AsyncClient(
             transport=ASGITransport(app=main.app), base_url="http://test",

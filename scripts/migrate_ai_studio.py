@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from alembic.util import CommandError
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -159,13 +160,14 @@ def backup_database(database: Path) -> Path | None:
 
 async def save_history(title: str, replies: list[Reply], times: list[datetime]) -> tuple[str, str]:
     """Commit the chat, ordered message chain and main branch in one transaction."""
-    from src.storage.database import async_session_factory, engine, init_db
+    from src.storage.database import async_session_factory, engine
+    from src.storage.migrations import upgrade_schema
     from src.storage.models import Branch, BranchStatus, Chat, Message, MessageRole, ModelMessage
 
     chat_id = str(uuid4())
     parent_id = None
     try:
-        await init_db()
+        await upgrade_schema(engine)
         async with async_session_factory.begin() as session:
             session.add(Chat(id=chat_id, title=title, created_at=times[0], updated_at=times[-1]))
             await session.flush()
@@ -235,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ids = asyncio.run(save_history(title, replies, times))
     except SQLAlchemyError as error:
         parser.exit(1, f"Ошибка импорта в SQLite ({type(error).__name__}).\n")
-    except (OSError, ValueError, OverflowError, sqlite3.Error) as error:
+    except (OSError, ValueError, OverflowError, sqlite3.Error, CommandError) as error:
         parser.exit(1, f"Ошибка импорта: {error}\n")
 
     users = sum(reply.role == "user" for reply in replies)

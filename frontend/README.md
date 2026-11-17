@@ -5,7 +5,7 @@
 Понадобятся Node.js 24 LTS, npm и установленное Python-окружение проекта.
 Команды ниже рассчитаны на PowerShell.
 
-В первом терминале из корня репозитория запусти FastAPI.
+В первом терминале из корня репозитория [подготовь SQLite](../docs/how-to/migrate-sqlite.md) и запусти FastAPI.
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn src.main:app --host 127.0.0.1 --port 8000
