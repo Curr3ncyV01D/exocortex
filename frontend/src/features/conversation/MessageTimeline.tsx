@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import type { ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -40,7 +40,7 @@ interface MessageCardProps {
   regenerateHeadId?: string
 }
 
-function MessageCard({ message, branchId, regenerateHeadId }: MessageCardProps) {
+const MessageCard = memo(function MessageCard({ message, branchId, regenerateHeadId }: MessageCardProps) {
   const [editing, setEditing] = useState(false)
   const created = new Date(message.created_at)
   const trace = message.role === 'model' ? readExecutionTrace(message.metadata) : null
@@ -107,7 +107,7 @@ function MessageCard({ message, branchId, regenerateHeadId }: MessageCardProps) 
       )}
     </li>
   )
-}
+})
 
 interface MessageTimelineProps {
   messages: MessageResponse[]

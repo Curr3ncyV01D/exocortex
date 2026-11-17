@@ -1,7 +1,8 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import App from '../src/App'
+import type { MessageResponse } from '../src/api/types'
 import { chat, main, side, timeline } from './fixtures'
 
 const chatsUrl = '/api/v1/chats'
@@ -43,6 +44,72 @@ it('shows the main timeline, renders Markdown and keeps masked messages in order
   await userEvent.click(within(messages[2]).getByText('Слияние ветки'))
   expect(within(messages[2]).getByText('Итог ветки')).toBeVisible()
   expect(screen.getByRole('combobox', { name: 'Ветка' })).toHaveValue(main.id)
+})
+
+it('reveals older pages on upward scroll and resets when selecting a branch', async () => {
+  const history: MessageResponse[] = Array.from({ length: 85 }, (_, index) => ({
+    ...timeline[0],
+    id: String(index + 1),
+    parent_id: index === 0 ? null : String(index),
+    role: 'user',
+    content: 'Реплика ' + (index + 1),
+  }))
+  const reply: MessageResponse = {
+    ...history[84], id: '86', parent_id: '85', role: 'model', content: 'Новый ответ',
+  }
+  const mock = mockReadApi({
+    [chatsUrl]: () => Response.json([chat]),
+    [branchesUrl]: () => Response.json([main, side]),
+    [timelineUrl(main.id)]: () => Response.json(history),
+    [timelineUrl(side.id)]: () => Response.json(history.slice(0, 45)),
+    ['/api/v1/branches/' + main.id + '/run']: () => Response.json(reply),
+  })
+  render(<App />)
+
+  const list = () => within(screen.getByRole('list', { name: 'История сообщений' }))
+  await screen.findByText('Реплика 85')
+  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 46')
+  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
+
+  const scrollArea = screen.getByRole('list', { name: 'История сообщений' })
+    .closest<HTMLDivElement>('[data-timeline-scroll]')!
+  Object.defineProperty(scrollArea, 'scrollHeight', { get: () => list().getAllByRole('listitem').length * 70 })
+  const scrollTo = (top: number) => {
+    scrollArea.scrollTop = top
+    fireEvent.scroll(scrollArea)
+  }
+  const requestsBeforeReveal = mock.mock.calls.length
+  scrollTo(100)
+  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  scrollTo(800)
+  scrollTo(251)
+  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  scrollTo(250)
+  expect(list().getAllByRole('listitem')).toHaveLength(80)
+  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 6')
+  expect(scrollArea.scrollTop).toBe(250 + 40 * 70)
+  fireEvent.scroll(scrollArea)
+  expect(list().getAllByRole('listitem')).toHaveLength(80)
+  scrollTo(120)
+  expect(list().getAllByRole('listitem')).toHaveLength(85)
+  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 1')
+  expect(screen.queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
+  expect(mock).toHaveBeenCalledTimes(requestsBeforeReveal)
+
+  await userEvent.click(screen.getByRole('button', { name: /^Run$/ }))
+  expect(await screen.findByText('Новый ответ')).toBeVisible()
+  expect(list().getAllByRole('listitem')).toHaveLength(86)
+
+  const branchPicker = screen.getByRole('combobox', { name: 'Ветка' })
+  await userEvent.selectOptions(branchPicker, side.id)
+  await screen.findByText('Реплика 45')
+  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(list().queryByText('Реплика 5')).not.toBeInTheDocument()
+  await userEvent.selectOptions(branchPicker, main.id)
+  await screen.findByText('Реплика 85')
+  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
 })
 
 /** A slow reply from the previous branch must not replace the selected history. */

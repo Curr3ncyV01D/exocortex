@@ -1,11 +1,47 @@
-import { useLayoutEffect, useRef } from 'react'
-import type { ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
+import type { ComponentProps, ReactNode, RefObject } from 'react'
 import { LoadError } from '../../components/LoadError'
 import { useWorkspace } from '../../store/workspace'
 import { BranchPicker } from '../branches/BranchPicker'
 import { MergeAction } from '../branches/MergeAction'
 import { ChatInput } from './ChatInput'
 import { MessageTimeline } from './MessageTimeline'
+
+const TIMELINE_PAGE_SIZE = 40
+const TIMELINE_REVEAL_DISTANCE = 250
+
+function PagedMessageTimeline({
+  messages, scrollArea, ...timelineProps
+}: ComponentProps<typeof MessageTimeline> & { scrollArea: RefObject<HTMLDivElement | null> }) {
+  const [expandedStart, setExpandedStart] = useState<number | null>(null)
+  const scrollBeforeReveal = useRef<{ height: number; top: number } | null>(null)
+  const tailStart = Math.max(0, messages.length - TIMELINE_PAGE_SIZE)
+  const start = Math.min(expandedStart ?? tailStart, tailStart)
+
+  useLayoutEffect(() => {
+    const area = scrollArea.current
+    if (!area) return
+    const previous = scrollBeforeReveal.current
+    scrollBeforeReveal.current = null
+    if (previous) area.scrollTop = previous.top + area.scrollHeight - previous.height
+    if (start === 0) return
+
+    let lastTop = Math.max(0, area.scrollTop)
+    const revealOnScroll = () => {
+      const top = Math.max(0, area.scrollTop)
+      const movedUp = top < lastTop
+      lastTop = top
+      if (!movedUp || top > TIMELINE_REVEAL_DISTANCE || scrollBeforeReveal.current) return
+
+      scrollBeforeReveal.current = { height: area.scrollHeight, top }
+      setExpandedStart(Math.max(0, start - TIMELINE_PAGE_SIZE))
+    }
+    area.addEventListener('scroll', revealOnScroll, { passive: true })
+    return () => area.removeEventListener('scroll', revealOnScroll)
+  }, [start, scrollArea])
+
+  return <MessageTimeline {...timelineProps} messages={messages.slice(start)} />
+}
 
 export function Conversation({ navigation }: { navigation: ReactNode }) {
   const chats = useWorkspace((state) => state.chats)
@@ -49,7 +85,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           </div>
         </div>
       </header>
-      <div ref={scrollArea} data-timeline-scroll className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+      <div ref={scrollArea} data-timeline-scroll className="min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:none]">
         <div className="conversation-column py-4 md:py-6">
           {chats.status === 'ready' && !chat && (
             <p className="text-sm text-muted">Создайте чат, чтобы открыть его историю.</p>
@@ -67,8 +103,10 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
           {timeline.status === 'ready' && (
             timeline.data.length > 0
-              ? <MessageTimeline
+              ? <PagedMessageTimeline
+                  key={activeBranchId}
                   messages={timeline.data}
+                  scrollArea={scrollArea}
                   branchId={activeBranchId ?? undefined}
                   regeneration={headId && dialogue?.role === 'model' ? { messageId: dialogue.id, headId } : undefined}
                 />
