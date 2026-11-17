@@ -1,6 +1,7 @@
 **
 !Dockerfile
 !requirements.txt
+!constraints.txt
 !alembic.ini
 !migrations/
 !migrations/**

@@ -94,14 +94,15 @@ async def test_turn_budget_rejects_oversized_latest_message(session, initial_cha
 async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_fts(
     session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An oversized historical message remains discoverable as a bounded tool result."""
     chat_id = initial_chat_setup["chat_id"]
-    await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 200, session)
-    orphan = await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
+    archived = await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 600, session)
+    await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
     hot_text = "Последний вопрос об ArchiveMarker"
     latest = await append_message(chat_id, "main", MessageRole.USER, hot_text, session)
     latest_id = latest.id
-    budget = _contents_size(map_messages_to_gemini([orphan, latest])) + 1500
-    # Make the older message larger than the remaining budget even before the orphan is removed.
+    budget = 4096
+    assert _contents_size(map_messages_to_gemini([archived])) > budget
     await session.commit()
     monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
     requests = []
@@ -121,6 +122,7 @@ async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_f
     assert [item.role for item in requests[0]] == ["user"]
     assert [part.text for part in requests[0][0].parts] == [hot_text]
     tool_result = requests[1][-1].parts[0].function_response
+    assert tool_result is not None
     assert "ArchiveMarker" in tool_result.response["result"]
     assert hot_text not in tool_result.response["result"]
     assert all(_contents_size(request) <= budget for request in requests)

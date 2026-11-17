@@ -19,13 +19,15 @@ htmlcov/
 
 # --- Secrets & Environment Variables ---
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # --- Application Data & SQLite Storage ---
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.db-journal
+data/*.sqlite*
 data/*.bak_*
 data/raw/*
 !data/raw/.gitkeep

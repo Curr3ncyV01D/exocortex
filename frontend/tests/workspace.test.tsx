@@ -66,50 +66,52 @@ it('reveals older pages on upward scroll and resets when selecting a branch', as
   })
   render(<App />)
 
-  const list = () => within(screen.getByRole('list', { name: 'История сообщений' }))
+  const list = () => screen.getByRole('list', { name: 'История сообщений' })
+  const cards = () => list().children
   await screen.findByText('Реплика 85')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 46')
-  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
+  expect(cards()).toHaveLength(40)
+  expect(cards()[0]).toHaveTextContent('Реплика 46')
+  expect(within(list()).queryByText('Реплика 45')).not.toBeInTheDocument()
 
-  const scrollArea = screen.getByRole('list', { name: 'История сообщений' })
-    .closest<HTMLDivElement>('[data-timeline-scroll]')!
-  Object.defineProperty(scrollArea, 'scrollHeight', { get: () => list().getAllByRole('listitem').length * 70 })
+  const scrollArea = list().closest<HTMLDivElement>('[data-timeline-scroll]')!
+  Object.defineProperty(scrollArea, 'scrollHeight', {
+    get: () => (scrollArea.querySelector('ol[aria-label="История сообщений"]')?.childElementCount ?? 0) * 70,
+  })
   const scrollTo = (top: number) => {
     scrollArea.scrollTop = top
     fireEvent.scroll(scrollArea)
   }
   const requestsBeforeReveal = mock.mock.calls.length
   scrollTo(100)
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(cards()).toHaveLength(40)
   scrollTo(800)
   scrollTo(251)
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(cards()).toHaveLength(40)
   scrollTo(250)
-  expect(list().getAllByRole('listitem')).toHaveLength(80)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 6')
+  expect(cards()).toHaveLength(80)
+  expect(cards()[0]).toHaveTextContent('Реплика 6')
   expect(scrollArea.scrollTop).toBe(250 + 40 * 70)
   fireEvent.scroll(scrollArea)
-  expect(list().getAllByRole('listitem')).toHaveLength(80)
+  expect(cards()).toHaveLength(80)
   scrollTo(120)
-  expect(list().getAllByRole('listitem')).toHaveLength(85)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 1')
-  expect(screen.queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
+  expect(cards()).toHaveLength(85)
+  expect(within(scrollArea).queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
   expect(mock).toHaveBeenCalledTimes(requestsBeforeReveal)
 
-  await userEvent.click(screen.getByRole('button', { name: /^Run$/ }))
+  const composer = screen.getByRole('form', { name: 'Ввод сообщения' })
+  await userEvent.click(within(composer).getByRole('button', { name: /^Run$/ }))
   expect(await screen.findByText('Новый ответ')).toBeVisible()
-  expect(list().getAllByRole('listitem')).toHaveLength(86)
+  expect(cards()).toHaveLength(86)
 
   const branchPicker = screen.getByRole('combobox', { name: 'Ветка' })
   await userEvent.selectOptions(branchPicker, side.id)
   await screen.findByText('Реплика 45')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().queryByText('Реплика 5')).not.toBeInTheDocument()
+  expect(cards()).toHaveLength(40)
+  expect(within(list()).queryByText('Реплика 5')).not.toBeInTheDocument()
   await userEvent.selectOptions(branchPicker, main.id)
   await screen.findByText('Реплика 85')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
+  expect(cards()).toHaveLength(40)
+  expect(within(list()).queryByText('Реплика 45')).not.toBeInTheDocument()
 })
 
 /** A slow reply from the previous branch must not replace the selected history. */

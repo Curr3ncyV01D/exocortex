@@ -3,7 +3,7 @@ FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 
-COPY requirements.txt ./
+COPY requirements.txt constraints.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip python -m pip install -r requirements.txt
 
 COPY alembic.ini ./
