@@ -1,9 +1,18 @@
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.storage.crud.chats import get_chat_memory_overview, read_context_around
 from src.storage.crud.graph import get_latest_merge_event
 from src.storage.fts import InvalidSearchDateError, query_messages_fts
+from src.storage.models import MessageRole
+
+
+def _format_snippet(message_id: str, created_at: datetime, role: MessageRole, content: str) -> str:
+    if len(content) > 800:
+        content = content[:800] + " [...]"
+    return f"[ID: {message_id}] [{created_at:%Y-%m-%d %H:%M}] {role.value}: {content}"
 
 
 async def search_history_fts(
@@ -34,16 +43,42 @@ async def search_history_fts(
     if not rows:
         return "Ничего не найдено."
 
-    snippets: list[str] = []
-    for row in rows:
-        content = row.content
-        if len(content) > 800:
-            content = content[:800] + " [...]"
+    return "\n---\n".join(_format_snippet(row.id, row.created_at, row.role, row.content) for row in rows)
 
-        created_str = row.created_at.strftime("%Y-%m-%d %H:%M")
-        snippets.append(f"[ID: {row.id}] [{created_str}] {row.role.value}: {content}")
 
+async def get_history_context(
+    chat_id: str, message_id: str, radius: int = 3, *, session: AsyncSession, head_id: str | None = None,
+) -> str:
+    """Format an active message and its graph neighbors."""
+    neighborhood = await read_context_around(chat_id, message_id, radius, session, head_id=head_id)
+    if neighborhood is None:
+        return "Активное сообщение не найдено."
+    snippets = [
+        _format_snippet(message.id, message.created_at, message.role, message.content)
+        for message in neighborhood.messages
+    ]
+    if neighborhood.stopped_at_fork:
+        snippets.append("Дальше в истории развилка на несколько веток.")
     return "\n---\n".join(snippets)
+
+
+async def get_chat_overview(chat_id: str, *, session: AsyncSession) -> str:
+    """Format chat dates, volume and available branch summaries."""
+    overview = await get_chat_memory_overview(chat_id, session)
+    period = "активных сообщений нет"
+    if overview.earliest is not None and overview.latest is not None:
+        period = f"{overview.earliest:%Y-%m-%d %H:%M} — {overview.latest:%Y-%m-%d %H:%M}"
+    lines = [f"Активных сообщений: {overview.active_count}", f"Период (UTC): {period}", "Ветки:"]
+    summary_status = {
+        None: "сводки нет",
+        True: "сводка доступна",
+        False: "последняя сводка скрыта",
+    }
+    lines.extend(
+        f"- {branch.name} ({branch.status.value}) — {summary_status[branch.latest_summary_active]}"
+        for branch in overview.branches
+    )
+    return "\n".join(lines)
 
 
 async def get_branch_summary(

@@ -1,12 +1,137 @@
+import re
 import uuid
 from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.agent import tools
 from src.agent.tools import get_branch_summary, search_history_fts
 from src.storage.crud.graph import toggle_message_active, update_message_content
-from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
+from src.storage.models import Branch, BranchStatus, Chat, MergeEvent, Message, MessageRole
+
+
+@pytest.mark.asyncio
+async def test_read_context_around_clamps_radius_and_skips_masked_nodes(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Navigate both directions through hidden nodes without returning their content."""
+    chat_id = initial_chat_setup["chat_id"]
+    chain: list[Message] = []
+    for index in range(15):
+        chain.append(Message(
+            chat_id=chat_id,
+            parent=chain[-1] if chain else None,
+            content="x" * 900 if index == 7 else f"Реплика {index}",
+            is_active=index not in (6, 8),
+        ))
+    session.add_all(chain)
+    await session.commit()
+
+    center = chain[7]
+    short = await tools.get_history_context(chat_id, center.id, 0, session=session)
+    assert re.findall(r"\[ID: ([^\]]+)\]", short) == [chain[i].id for i in (5, 7, 9)]
+    assert "x" * 800 + " [...]" in short
+    assert "x" * 801 not in short
+
+    wide = await tools.get_history_context(chat_id, center.id, 100, session=session)
+    assert re.findall(r"\[ID: ([^\]]+)\]", wide) == [
+        message.id for message in chain[1:14] if message.is_active
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_context_around_respects_branch_and_chat_boundaries(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Use the current branch at a fork, and stop when its direction is ambiguous."""
+    chat_id = initial_chat_setup["chat_id"]
+    root = await session.get(Message, initial_chat_setup["root_message_id"])
+    assert root is not None
+    fork = Message(chat_id=chat_id, parent=root, content="Общий узел")
+    hidden = Message(chat_id=chat_id, parent=fork, content="Скрытый узел", is_active=False)
+    preferred = Message(chat_id=chat_id, parent=hidden, content="Выбранная ветка")
+    after_head = Message(chat_id=chat_id, parent=preferred, content="За вершиной")
+    other = Message(chat_id=chat_id, parent=fork, content="Другая ветка")
+    foreign = Message(chat=Chat(title="Другой чат"), content="Чужая реплика")
+    session.add_all([after_head, other, foreign])
+    await session.commit()
+
+    local = await tools.get_history_context(chat_id, fork.id, session=session, head_id=preferred.id)
+    assert root.id in local and fork.id in local and preferred.id in local
+    assert all(node.id not in local for node in (hidden, other, after_head, foreign))
+
+    ambiguous = await tools.get_history_context(chat_id, fork.id, session=session, head_id=root.id)
+    assert fork.id in ambiguous and "развилк" in ambiguous
+    assert preferred.id not in ambiguous and other.id not in ambiguous
+
+    for unavailable in (hidden.id, foreign.id, "unknown-message"):
+        assert await tools.get_history_context(chat_id, unavailable, session=session) == "Активное сообщение не найдено."
+
+
+@pytest.mark.asyncio
+async def test_chat_overview_counts_active_history_and_checks_latest_summary(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """A hidden latest merge does not make an older summary available."""
+    chat_id = initial_chat_setup["chat_id"]
+    root = await session.get(Message, initial_chat_setup["root_message_id"])
+    assert root is not None
+    root.created_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    date = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    old_summary = MergeEvent(
+        chat_id=chat_id, parent=root, content="Старая выжимка", created_at=date,
+        source_branch_name="разбор/Первая ветка", forked_from_msg_id=root.id, compressed_messages_count=1,
+    )
+    new_summary = MergeEvent(
+        chat_id=chat_id, parent=old_summary, content="Последняя выжимка", created_at=date, is_active=False,
+        source_branch_name="разбор/Первая ветка", forked_from_msg_id=root.id, compressed_messages_count=1,
+    )
+    hidden = Message(chat_id=chat_id, content="Скрытая крайняя дата", is_active=False,
+                     created_at=datetime(2026, 12, 1, tzinfo=timezone.utc))
+    foreign_chat = Chat(title="Чужой чат")
+    foreign_root = Message(
+        id=str(uuid.uuid4()), chat=foreign_chat, content="Чужая история",
+        created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    foreign_summary = MergeEvent(
+        chat=foreign_chat, parent=foreign_root, content="Чужая выжимка",
+        created_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_branch_name="разбор/Первая ветка", forked_from_msg_id=foreign_root.id, compressed_messages_count=1,
+    )
+    session.add_all([
+        new_summary, hidden,
+        Branch(chat_id=chat_id, name="разбор/Первая ветка", status=BranchStatus.MERGED),
+        Branch(chat_id=chat_id, name="архив", status=BranchStatus.ARCHIVED),
+        foreign_summary,
+        Branch(chat=foreign_chat, name="чужая ветка"),
+        Branch(chat=foreign_chat, name="разбор/Первая ветка"),
+    ])
+    await session.commit()
+
+    overview = await tools.get_chat_overview(chat_id, session=session)
+    assert "Активных сообщений: 2" in overview
+    assert "2026-05-01 00:00 — 2026-06-01 00:00" in overview
+    assert "main (active)" in overview and "архив (archived)" in overview
+    assert "разбор/Первая ветка (merged) — последняя сводка скрыта" in overview
+    assert "чужая ветка" not in overview
+
+    await toggle_message_active(new_summary.id, session)
+    refreshed = await tools.get_chat_overview(chat_id, session=session)
+    assert "Активных сообщений: 3" in refreshed
+    assert "разбор/Первая ветка (merged) — сводка доступна" in refreshed
+
+
+@pytest.mark.asyncio
+async def test_chat_overview_handles_an_empty_chat(session: AsyncSession) -> None:
+    chat = Chat(title="Пустой чат")
+    session.add(Branch(chat=chat, name="main"))
+    await session.commit()
+
+    overview = await tools.get_chat_overview(chat.id, session=session)
+    assert "Активных сообщений: 0" in overview
+    assert "активных сообщений нет" in overview
+    assert "main (active) — сводки нет" in overview
 
 
 @pytest.mark.asyncio

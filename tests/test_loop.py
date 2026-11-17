@@ -355,6 +355,42 @@ async def test_run_turn_with_tool_call_and_real_fts_search(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_registers_and_invokes_memory_navigation_tools(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Gemini can navigate the current chat without choosing a chat or branch ID."""
+    chat_id = initial_chat_setup["chat_id"]
+    anchor_id = initial_chat_setup["root_message_id"]
+    with patch("src.agent.client.genai.Client"):
+        client = GeminiClient(api_key="test-key")
+        client.generate_step = AsyncMock(side_effect=[
+            _make_tool_call_response([
+                ("get_chat_overview", {}),
+                ("read_context_around", {"message_id": anchor_id, "radius": 1}),
+            ]),
+            _make_text_response("Нашёл исходный вопрос."),
+        ])
+        result = await run_turn(chat_id, "main", client, session, user_prompt="Текущий вопрос")
+
+    declarations = {
+        tool.__name__: types.FunctionDeclaration.from_callable_with_api_option(callable=tool)
+        for tool in client.generate_step.await_args_list[0].kwargs["tools"]
+    }
+    assert declarations.keys() == {"search_history", "get_summary", "get_chat_overview", "read_context_around"}
+    overview = declarations["get_chat_overview"].parameters
+    assert overview is None or not overview.properties
+    context = declarations["read_context_around"].parameters
+    assert context is not None
+    assert set(context.properties or {}) == {"message_id", "radius"}
+    assert context.required == ["message_id"]
+
+    steps = json.loads(result.metadata_json or "{}")["execution_trace"]["steps"]
+    assert "Активных сообщений: 2" in steps[0]["output_summary"]
+    assert f"[ID: {anchor_id}]" in steps[1]["output_summary"]
+    assert "Текущий вопрос" in steps[1]["output_summary"]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_excludes_every_context_node_from_search(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],

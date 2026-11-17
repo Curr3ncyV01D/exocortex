@@ -78,13 +78,16 @@ async def get_branch(
     )
 
 
+LATEST_MERGE_EVENT_ORDER = (MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+
+
 async def get_latest_merge_event(
     chat_id: str, branch_name: str, session: AsyncSession,
 ) -> Optional[MergeEvent]:
     return await session.scalar(
         select(MergeEvent)
         .where(MergeEvent.chat_id == chat_id, MergeEvent.source_branch_name == branch_name)
-        .order_by(MergeEvent.created_at.desc(), literal_column("messages.rowid").desc())
+        .order_by(*LATEST_MERGE_EVENT_ORDER)
         .execution_options(populate_existing=True)
         .limit(1)
     )

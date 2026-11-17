@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient, ToolCall, map_messages_to_gemini
 from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
-from src.agent.tools import get_branch_summary, search_history_fts
+from src.agent.tools import (
+    get_branch_summary,
+    get_chat_overview as format_chat_overview,
+    get_history_context,
+    search_history_fts,
+)
 from src.config import settings
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
@@ -203,7 +208,7 @@ async def _run_turn(
                 raise BranchConflictError("Ожидающий вопрос изменился. Проверьте историю ветки.")
             contents, active_ids = _context_window(timeline, budget, timeline.index(question))
             final_text, trace = await _generate_from_snapshot(
-                chat_id, client, snapshot, contents, active_ids, budget, max_iterations,
+                chat_id, client, snapshot, contents, active_ids, budget, max_iterations, head_id=head_id,
             )
 
         reply_metadata = {"reply_to_message_id": question_id, "execution_trace": trace}
@@ -232,6 +237,8 @@ async def _generate_from_snapshot(
     active_ids: list[str],
     budget: int,
     max_iterations: int,
+    *,
+    head_id: str | None,
 ) -> tuple[str, dict[str, Any]]:
     async def generate(
         tools: list[Callable[..., Any]] | None,
@@ -266,7 +273,15 @@ async def _generate_from_snapshot(
             session=snapshot,
         )
 
-    tools_list = [search_history, get_summary]
+    async def read_context_around(message_id: str, radius: int = 3) -> str:
+        """Читает активные реплики вокруг ID сообщения. Радиус от 1 до 5 в каждую сторону."""
+        return await get_history_context(chat_id, message_id, radius, session=snapshot, head_id=head_id)
+
+    async def get_chat_overview() -> str:
+        """Возвращает диапазон дат, число активных реплик и доступность сводок по веткам."""
+        return await format_chat_overview(chat_id, session=snapshot)
+
+    tools_list = [search_history, get_summary, read_context_around, get_chat_overview]
     tool_registry: dict[str, Callable[..., Any]] = {
         tool.__name__: tool for tool in tools_list
     }
