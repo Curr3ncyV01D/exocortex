@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.exc import OperationalError
 from google.genai import types
+from google.genai.errors import ServerError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -696,7 +697,7 @@ async def test_run_turn_empty_or_blocked_model_response_raises_error(
 
 
 @pytest.mark.asyncio
-async def test_tool_failure_keeps_database_details_in_local_logs(
+async def test_tool_failure_logs_type_without_database_payload(
     session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
 ) -> None:
     details = OperationalError("SELECT local_marker", {"param": "private_marker"}, RuntimeError())
@@ -715,9 +716,45 @@ async def test_tool_failure_keeps_database_details_in_local_logs(
     trace = json.loads(answer.metadata_json)["execution_trace"]["steps"][0]
     assert "Ошибка" in output
     assert trace["output_summary"] == output
+    assert "gemini_tool_failed" in caplog.text
+    assert "tool=search_history error_type=OperationalError" in caplog.text
     for marker in ("local_marker", "private_marker"):
         assert marker not in output
-        assert marker in caplog.text
+        assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_after_history_lookup_is_correlated_with_the_tool(
+    session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real local lookup completes before the mocked provider rejects the next round."""
+    chat_id = initial_chat_setup["chat_id"]
+    archived = Message(chat_id=chat_id, role=MessageRole.USER, content="PrivateArchiveMarker")
+    session.add(archived)
+    await session.commit()
+    caplog.set_level("INFO", logger="uvicorn.error.exocortex")
+    failure = ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "private-provider-body"}})
+    client = GeminiClient(api_key="private-key", model_name="test-model")
+    client.generate_step = AsyncMock(side_effect=[
+        _make_tool_call_response([("search_history", {"query": "PrivateArchiveMarker"})]),
+        failure,
+    ])
+    with pytest.raises(LLMGenerationError, match="Сбой вызова Gemini") as caught:
+        await run_turn(chat_id, "main", client, session)
+
+    assert caught.value.__cause__ is failure
+    followup = client.generate_step.await_args.kwargs["contents"][-1]
+    assert "PrivateArchiveMarker" in followup.parts[0].function_response.response["result"]
+    started_log, tool_log, failure_log = [
+        record.getMessage() for record in caplog.records if record.name == "uvicorn.error.exocortex"
+    ]
+    assert "gemini_tool_started" in started_log
+    assert "tool=search_history outcome=ok" in tool_log
+    assert started_log.split()[1] == tool_log.split()[1] == failure_log.split()[1]
+    assert "phase=after_tools model=test-model" in failure_log
+    assert "kind=provider_http upstream_http=503 upstream_status=UNAVAILABLE" in failure_log
+    assert "private-provider-body" in caplog.text
+    assert all(marker not in caplog.text for marker in ("PrivateArchiveMarker", "private-key"))
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,10 @@ class GeminiClient:
         self._sdk_client: genai.Client | None = None
 
     @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
     def _client(self) -> genai.Client:
         if self._sdk_client is None:
             self._sdk_client = genai.Client(api_key=self._api_key)

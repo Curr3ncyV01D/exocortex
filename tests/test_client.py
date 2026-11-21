@@ -2,6 +2,9 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx2
+from google.genai.errors import ClientError
+from src.agent.diagnostics import describe_failure
 from google.genai import types
 
 from src.agent.client import GeminiClient, map_messages_to_gemini
@@ -194,3 +197,25 @@ async def test_gemini_client_summarize_delta_none_response() -> None:
         summary = await client.summarize_delta(delta_messages=delta)
 
         assert summary == ""
+
+
+def test_gemini_diagnostics_distinguish_proxy_network_and_timeout() -> None:
+    for error, kind in (
+        (httpx2.ProxyError("private proxy URL"), "proxy"),
+        (httpx2.ConnectError("private request URL"), "transport"),
+        (httpx2.ReadTimeout("private request URL"), "timeout"),
+    ):
+        description = describe_failure(error)
+        assert f"kind={kind}" in description
+        assert "private" in description
+
+
+def test_precondition_detail_retains_the_provider_explanation() -> None:
+    error = ClientError(400, {"error": {
+        "status": "FAILED_PRECONDITION",
+        "message": "User location is not supported for the API use.\nCheck account.",
+    }})
+    diagnostic = describe_failure(error)
+    assert "upstream_http=400 upstream_status=FAILED_PRECONDITION" in diagnostic
+    assert "User location is not supported" in diagnostic
+    assert "\n" not in diagnostic

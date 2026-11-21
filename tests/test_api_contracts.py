@@ -2,6 +2,7 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+from google.genai.errors import ServerError
 from httpx import AsyncClient
 
 from src.config import settings
@@ -215,6 +216,31 @@ async def test_merge_empty_delta(api_client, api_gemini):
     assert created.status_code == 201
     assert (await api_client.post(f"/api/v1/branches/{created.json()['id']}/merge", json={})).status_code == 400
     api_gemini.summarize_delta.assert_not_awaited()
+
+
+async def test_merge_provider_failure_returns_502_and_logs_upstream_status(
+    api_client: AsyncClient, api_gemini, caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat, main = await create_api_chat(api_client)
+    root = await append_api_message(api_client, main.id, "Question")
+    fork = await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": "side", "target_message_id": root.id,
+    })
+    assert fork.status_code == 201
+    branch_id = fork.json()["id"]
+    await append_api_message(api_client, branch_id, "private-branch-text")
+    api_gemini.summarize_delta.side_effect = ServerError(
+        503, {"error": {"status": "UNAVAILABLE", "message": "private-provider-body"}},
+    )
+
+    response = await api_client.post(f"/api/v1/branches/{branch_id}/merge", json={})
+
+    assert response.status_code == 502
+    assert "phase=summarize" in caplog.text
+    assert "upstream_http=503 upstream_status=UNAVAILABLE" in caplog.text
+    assert "private-provider-body" not in response.text
+    assert "private-provider-body" in caplog.text
+    assert "private-branch-text" not in caplog.text
 
 
 async def test_run_rejects_stale_head(api_client, api_gemini):
