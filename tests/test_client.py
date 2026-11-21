@@ -1,13 +1,14 @@
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 import httpx2
-from google.genai.errors import ClientError
-from src.agent.diagnostics import describe_failure
+import pytest
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 from src.agent.client import GeminiClient, map_messages_to_gemini
+from src.agent.diagnostics import describe_failure, operation_scope, operation_id, operation_deadline
 from src.config import settings
 from src.storage.models import MergeEvent, Message, MessageRole
 
@@ -210,6 +211,71 @@ def test_gemini_diagnostics_distinguish_proxy_network_and_timeout() -> None:
         assert "private" in description
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "High demand"}}),
+    ServerError(504, {"error": {"status": "DEADLINE_EXCEEDED", "message": "Deadline expired"}}),
+    httpx2.ReadTimeout("Request timed out"),
+    httpx2.ConnectError("Connection failed"),
+    TimeoutError("Attempt deadline"),
+])
+async def test_generation_retries_transient_failures(failure: Exception) -> None:
+    """Two transient failures recover on attempt three with bounded backoff."""
+    result = types.GenerateContentResponse()
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ) as sleep, patch("src.agent.client.random.uniform", return_value=0):
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock(
+            side_effect=[failure, failure, result],
+        )
+        client = GeminiClient(api_key="test-key")
+        assert await client.generate_step([]) is result
+
+    assert generate.await_count == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1.5, 3.0]
+    assert generate.await_args.kwargs["config"].http_options.retry_options.attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [400, 401, 403, 404, 429])
+async def test_generation_does_not_retry_client_errors(code: int) -> None:
+    failure = ClientError(code, {"error": {"message": "Prerequisite not met"}})
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ) as sleep:
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock(side_effect=failure)
+        with pytest.raises(ClientError) as caught:
+            await GeminiClient(api_key="test-key").generate_step([])
+    assert caught.value is failure
+    generate.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_stops_after_three_failures() -> None:
+    failure = ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "High demand"}})
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ) as sleep:
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock(side_effect=failure)
+        with pytest.raises(ServerError) as caught:
+            await GeminiClient(api_key="test-key").generate_step([])
+    assert caught.value is failure
+    assert generate.await_count == 3 and sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_generation_cancellation_interrupts_retries() -> None:
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ) as sleep:
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await GeminiClient(api_key="test-key").generate_step([])
+    generate.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
 def test_precondition_detail_retains_the_provider_explanation() -> None:
     error = ClientError(400, {"error": {
         "status": "FAILED_PRECONDITION",
@@ -219,3 +285,46 @@ def test_precondition_detail_retains_the_provider_explanation() -> None:
     assert "upstream_http=400 upstream_status=FAILED_PRECONDITION" in diagnostic
     assert "User location is not supported" in diagnostic
     assert "\n" not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_summary_retries_share_the_operation_identifier(caplog: pytest.LogCaptureFixture) -> None:
+    failure = ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "Busy"}})
+    response = types.GenerateContentResponse(candidates=[types.Candidate(
+        content=types.Content(role="model", parts=[types.Part(text="Summary")]),
+        finish_reason=types.FinishReason.STOP,
+    )])
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ):
+        sdk.return_value.aio.models.generate_content = AsyncMock(side_effect=[failure, response])
+        with operation_scope("summary-operation", 50):
+            assert await GeminiClient(api_key="test-key").summarize_delta([]) == "Summary"
+        assert sdk.return_value.aio.models.generate_content.await_count == 2
+    assert "gemini_request_retry turn_id=summary-operation" in caplog.text
+    assert operation_id.get() == "-" and operation_deadline.get() is None
+
+
+@pytest.mark.asyncio
+async def test_retry_stops_before_a_backoff_exceeds_the_remaining_budget() -> None:
+    failure = ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "Busy"}})
+    with patch("src.agent.client.genai.Client") as sdk, patch(
+        "src.agent.client.asyncio.sleep", new_callable=AsyncMock,
+    ) as sleep:
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock(side_effect=failure)
+        with operation_scope("short-budget", 0.5):
+            with pytest.raises(TimeoutError, match="No time remains"):
+                await GeminiClient(api_key="test-key").generate_step([])
+    generate.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_prevents_network_calls_and_restores_context() -> None:
+    with patch("src.agent.client.genai.Client") as sdk:
+        generate = sdk.return_value.aio.models.generate_content = AsyncMock()
+        with operation_scope("expired-budget", -1):
+            with pytest.raises(TimeoutError, match="exhausted"):
+                await GeminiClient(api_key="test-key").generate_step([])
+        generate.assert_not_awaited()
+    assert operation_deadline.get() is None

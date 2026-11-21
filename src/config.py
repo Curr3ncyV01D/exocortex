@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
     MAX_CONTEXT_BYTES: int = Field(default=512_000, gt=0)
+    GEMINI_REQUEST_TIMEOUT_SECONDS: float = Field(default=300, gt=0)
+    AGENT_OPERATION_TIMEOUT_SECONDS: float = Field(default=1800, gt=0)
 
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",

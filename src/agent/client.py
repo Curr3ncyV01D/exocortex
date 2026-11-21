@@ -1,4 +1,7 @@
 import asyncio
+import random
+from time import monotonic
+from uuid import uuid4
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -11,11 +14,12 @@ from src.agent.prompts import (
     SUMMARIZER_SYSTEM_INSTRUCTION,
     SUMMARIZER_USER_PROMPT_TEMPLATE,
 )
+from src.agent.diagnostics import (
+    describe_failure, is_transient_failure, logger,
+    operation_id, operation_deadline, operation_scope,
+)
 from src.config import settings
 from src.storage.models import Message, MessageRole
-
-GEMINI_REQUEST_TIMEOUT_SECONDS = 30
-
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -111,12 +115,47 @@ class GeminiClient:
             tools=tools,
             automatic_function_calling=afc_config,
         )
-        async with asyncio.timeout(GEMINI_REQUEST_TIMEOUT_SECONDS):
-            return await self._client.aio.models.generate_content(
-                model=self._model_name,
-                contents=contents,
-                config=config,
+        return await self._generate(contents, config)
+
+    async def _generate(
+        self, contents: list[types.Content] | str, config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        if operation_deadline.get() is None:
+            with operation_scope(uuid4().hex, settings.AGENT_OPERATION_TIMEOUT_SECONDS):
+                return await self._generate(contents, config)
+        deadline = operation_deadline.get()
+        assert deadline is not None
+        for attempt in range(1, 4):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                logger.warning("gemini_budget_exhausted turn_id=%s", operation_id.get())
+                raise TimeoutError("Gemini operation time budget exhausted.")
+            timeout = min(settings.GEMINI_REQUEST_TIMEOUT_SECONDS, remaining)
+            config.http_options = types.HttpOptions(
+                timeout=max(1, int(timeout * 1000)),
+                retry_options=types.HttpRetryOptions(attempts=1),
             )
+            try:
+                async with asyncio.timeout(timeout):
+                    return await self._client.aio.models.generate_content(
+                        model=self._model_name,
+                        contents=contents,
+                        config=config,
+                    )
+            except Exception as error:
+                if attempt == 3 or not is_transient_failure(error):
+                    raise
+                delay = 1.5 * 2 ** (attempt - 1) + random.uniform(0, 0.5)
+                remaining = deadline - monotonic()
+                if remaining <= delay:
+                    logger.warning("gemini_budget_exhausted turn_id=%s %s", operation_id.get(), describe_failure(error))
+                    raise TimeoutError("No time remains for another Gemini attempt.") from error
+                logger.warning(
+                    "gemini_request_retry turn_id=%s model=%s attempt=%d next_attempt=%d delay_seconds=%.2f remaining_seconds=%.2f %s",
+                    operation_id.get(), self._model_name, attempt, attempt + 1, delay, remaining, describe_failure(error),
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("Unreachable retry state.")
 
     @staticmethod
     def extract_function_calls(
@@ -204,10 +243,5 @@ class GeminiClient:
             system_instruction=SUMMARIZER_SYSTEM_INSTRUCTION,
             temperature=0.3,
         )
-        async with asyncio.timeout(GEMINI_REQUEST_TIMEOUT_SECONDS):
-            response = await self._client.aio.models.generate_content(
-                model=self._model_name,
-                contents=prompt,
-                config=config,
-            )
+        response = await self._generate(prompt, config)
         return self.extract_response_text(response)

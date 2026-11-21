@@ -2,6 +2,26 @@
 
 import logging
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
+from time import monotonic
+
+operation_id: ContextVar[str] = ContextVar("gemini_operation_id", default="-")
+operation_deadline: ContextVar[float | None] = ContextVar("gemini_operation_deadline", default=None)
+
+
+@contextmanager
+def operation_scope(identifier: str, timeout: float) -> Iterator[None]:
+    """Keep the operation identifier and deadline isolated between concurrent tasks."""
+    identifier_token = operation_id.set(identifier)
+    deadline_token = operation_deadline.set(monotonic() + timeout)
+    try:
+        yield
+    finally:
+        operation_id.reset(identifier_token)
+        operation_deadline.reset(deadline_token)
+
 import httpx
 import httpx2
 from google.genai.errors import APIError
@@ -34,3 +54,13 @@ def describe_failure(error: Exception) -> str:
         kind = "transport"
     detail = json.dumps(str(error), ensure_ascii=False)
     return f"kind={kind} upstream_http={code} upstream_status={status} error_type={type(error).__name__} detail={detail}"
+
+
+def is_transient_failure(error: Exception) -> bool:
+    """Retry provider unavailability, timeouts and connection interruptions."""
+    if isinstance(error, APIError):
+        return error.code in (503, 504)
+    return isinstance(error, (
+        TimeoutError, httpx.TimeoutException, httpx2.TimeoutException,
+        httpx.ConnectError, httpx2.ConnectError,
+    ))

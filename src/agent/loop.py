@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient, ToolCall, map_messages_to_gemini
-from src.agent.diagnostics import describe_failure, logger
+from src.agent.diagnostics import describe_failure, logger, operation_scope
 from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
 from src.agent.tools import (
     get_branch_summary,
@@ -31,7 +31,6 @@ from src.storage.crud.graph import (
 from src.storage.models import Message, MessageRole
 
 _branch_locks: dict[str, asyncio.Lock] = {}
-TURN_TIMEOUT_SECONDS = 90
 MAX_TOOL_CALLS = 12
 
 
@@ -134,14 +133,15 @@ async def run_turn(
     if user_prompt is not None and not user_prompt.strip():
         raise ValueError("Промпт должен содержать текст.")
     turn_id = uuid4().hex
-    timeout = TURN_TIMEOUT_SECONDS
+    timeout = settings.AGENT_OPERATION_TIMEOUT_SECONDS
     turn_timeout = asyncio.timeout(timeout)
     try:
-        async with turn_timeout:
-            return await _run_turn(
-                chat_id, branch_name, client, session, user_prompt, max_iterations,
-                expected_head_id, expected_question_id, turn_id,
-            )
+        with operation_scope(turn_id, timeout):
+            async with turn_timeout:
+                return await _run_turn(
+                    chat_id, branch_name, client, session, user_prompt, max_iterations,
+                    expected_head_id, expected_question_id, turn_id,
+                )
     except TimeoutError as exc:
         if turn_timeout.expired():
             logger.warning("gemini_turn_timeout turn_id=%s limit_seconds=%.1f", turn_id, timeout)

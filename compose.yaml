@@ -8,6 +8,8 @@ services:
       - GEMINI_API_KEY
       - GEMINI_MODEL
       - MAX_CONTEXT_BYTES
+      - GEMINI_REQUEST_TIMEOUT_SECONDS
+      - AGENT_OPERATION_TIMEOUT_SECONDS
     volumes:
       - type: bind
         source: "${EXOCORTEX_DATA_DIR:-./data}"
@@ -21,6 +23,8 @@ services:
       retries: 12
 
   frontend:
+    environment:
+      PROXY_READ_TIMEOUT_SECONDS: "${PROXY_READ_TIMEOUT_SECONDS:-1860}"
     build:
       context: ./frontend
     depends_on:

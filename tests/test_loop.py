@@ -68,11 +68,11 @@ async def test_turn_deadline_releases_lock_and_keeps_question(
             await asyncio.sleep(1)
 
         client.generate_step = AsyncMock(side_effect=slow_generation)
-        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 0.25)
+        monkeypatch.setattr(settings, "AGENT_OPERATION_TIMEOUT_SECONDS", 0.25)
         with pytest.raises(LLMGenerationError, match="лимит времени"):
             await run_turn(chat_id, "main", client, session, "Question")
         assert not session.in_transaction()
-        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 90)
+        monkeypatch.setattr(settings, "AGENT_OPERATION_TIMEOUT_SECONDS", 1800)
         client.generate_step = AsyncMock(return_value=_make_text_response("Recovered"))
         answer = await run_turn(chat_id, "main", client, session)
         question = await session.get(Message, answer.parent_id)
