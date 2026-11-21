@@ -132,8 +132,8 @@ sequenceDiagram
     Loop->>Client: map_messages_to_gemini(timeline)
 
     rect rgb(20, 35, 30)
-    Note over Loop,Tools: Эфимерный ReAct-цикл в RAM (max_iterations = 3)
-    loop Пока i < 3 и есть function_calls
+    Note over Loop,Tools: Эфимерный ReAct-цикл в RAM (max_iterations = 8)
+    loop Пока i < 8 и есть function_calls
         Loop->>Client: generate_step(contents, tools)
         alt Модель запросила инструменты
             Client-->>Loop: function_calls
@@ -148,7 +148,7 @@ sequenceDiagram
     end
     end
 
-    opt Превышен лимит 3 итераций (Graceful Fallback)
+    opt Превышен лимит 8 итераций (Graceful Fallback)
         Loop->>Client: append_user_text(FALLBACK_MAX_ITERATIONS_PROMPT)
         Loop->>Client: generate_step(contents, tools=None)
     end
@@ -202,4 +202,4 @@ sequenceDiagram
 Сценарии подсистемы проверяются без сетевых запросов с помощью `pytest` и `AsyncMock`.
 * **`tests/test_tools.py`:** Проверка морфологии `FTSQueryBuilder`, экранирования спецсимволов FTS5, изоляции между чатами, триггеров синхронизации после `Edit`/`Toggle`, усечения сниппетов и инкрементальной выборки `get_branch_summary`.
 * **`tests/test_client.py`:** Проверка маппинга ролей, системного префикса `SYSTEM_MERGE`, склеивания смежных `user`-реплик, проброса конфигов и защиты от `None`-ответа SDK.
-* **`tests/test_loop.py`:** Проверка прямого ответа, реального сквозного поиска в ReAct-цикле, Loop Guard, принудительного Fallback на 3-й итерации, сохранения промпта при сбое API, режима `user_prompt=None`, защиты от пустых ответов, восстановления при галлюцинации имени тула и блокировки `BranchBusyError`.
+* **`tests/test_loop.py`:** Проверка прямого ответа, реального сквозного поиска в ReAct-цикле, Loop Guard, принудительного Fallback после исчерпания заданного числа итераций, сохранения промпта при сбое API, режима `user_prompt=None`, защиты от пустых ответов, восстановления при галлюцинации имени тула и блокировки `BranchBusyError`.

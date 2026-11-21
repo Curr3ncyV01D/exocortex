@@ -123,7 +123,7 @@ async def run_turn(
     client: GeminiClient,
     session: AsyncSession,
     user_prompt: Optional[str] = None,
-    max_iterations: int = 3,
+    max_iterations: int = 8,
     *,
     expected_head_id: Optional[str] = None,
     expected_question_id: Optional[str] = None,

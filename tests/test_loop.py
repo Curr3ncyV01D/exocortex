@@ -453,6 +453,26 @@ async def test_run_turn_loop_guard_blocks_duplicate_calls(
 
 
 @pytest.mark.asyncio
+async def test_default_turn_allows_eight_tool_rounds_then_synthesizes(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Eight distinct calls finish with one final response without tools."""
+    from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
+
+    client = GeminiClient(api_key="test-key")
+    client.generate_step = AsyncMock(side_effect=[
+        *[_make_tool_call_response([("get_summary", {"branch_name": f"branch-{i}"})]) for i in range(8)],
+        _make_text_response("Подтверждённых сведений о решении в истории нет."),
+    ])
+    answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+    assert client.generate_step.await_count == 9
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    final_history = client.generate_step.await_args.kwargs["contents"]
+    assert any(part.text == FALLBACK_MAX_ITERATIONS_PROMPT for part in final_history[-1].parts)
+    assert json.loads(answer.metadata_json)["execution_trace"]["iterations_used"] == 8
+
+
+@pytest.mark.asyncio
 async def test_run_turn_max_iterations_fallback(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
