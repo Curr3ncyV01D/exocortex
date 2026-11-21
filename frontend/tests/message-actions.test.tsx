@@ -9,7 +9,7 @@ const original: MessageResponse = { ...timeline[0], role: 'user', content: '**И
 const branchName = 'исследование/Разбор ёлки'
 const editTimestamp = '2026-11-16T14:35:00Z'
 
-function mockMessageApi({ shared = false, forkConflict = false, editConflict = false } = {}) {
+function mockMessageApi({ shared = false, forkConflict = false, editConflict = false, loseMaskResponse = false } = {}) {
   let message = original
   const fork = { ...side, id: 'new-branch', name: branchName, head_message_id: original.id }
   const branches = shared ? [main, side] : [main]
@@ -19,7 +19,7 @@ function mockMessageApi({ shared = false, forkConflict = false, editConflict = f
     if (path === '/api/v1/chats') return Response.json([chat])
     if (path.endsWith('/timeline')) return Response.json([message])
     if (path.endsWith('/branches') && options.method !== 'POST') return Response.json(branches)
-    const body = options.body ? JSON.parse(String(options.body)) as { content?: string; force?: boolean } : undefined
+    const body = options.body ? JSON.parse(String(options.body)) as { content?: string; force?: boolean; is_active?: boolean } : undefined
     requests.push({ method: options.method ?? 'GET', path, body })
     if (path === '/api/v1/messages/question' && options.method === 'PATCH' && body?.content) {
       if (editConflict) return Response.json({ detail: 'Реплика изменилась.' }, { status: 409 })
@@ -29,8 +29,12 @@ function mockMessageApi({ shared = false, forkConflict = false, editConflict = f
       message = { ...message, content: body.content, is_edited: true, updated_at: editTimestamp }
       return Response.json(message)
     }
-    if (path === '/api/v1/messages/question/toggle-active') {
-      message = { ...message, is_active: !message.is_active }
+    if (path === '/api/v1/messages/question/active' && options.method === 'PUT' && typeof body?.is_active === 'boolean') {
+      message = { ...message, is_active: body.is_active }
+      if (loseMaskResponse) {
+        loseMaskResponse = false
+        throw new TypeError('Response lost after saving the mask')
+      }
       return Response.json({ message_id: message.id, is_active: message.is_active })
     }
     if (path === `/api/v1/chats/${chat.id}/branches` && options.method === 'POST') {
@@ -116,7 +120,7 @@ it('keeps the edit open and does not force an unrelated 409', async () => {
 
 /** A mask belongs to the message and is visible through both branches sharing it. */
 it('masks and restores the same message across branches without removing it from the timeline', async () => {
-  mockMessageApi({ shared: true })
+  const requests = mockMessageApi({ shared: true })
   const user = userEvent.setup()
   render(<App />)
   await menuAction(user, 'Скрыть из контекста')
@@ -129,6 +133,10 @@ it('masks and restores the same message across branches without removing it from
   await user.selectOptions(screen.getByRole('combobox', { name: 'Ветка' }), main.id)
   expect(await messageRow()).toHaveTextContent('Исходная реплика')
   expect(screen.queryByText('Вне контекста')).not.toBeInTheDocument()
+  expect(requests.map(({ method, path, body }) => ({ method, path, body }))).toEqual([
+    { method: 'PUT', path: '/api/v1/messages/question/active', body: { is_active: false } },
+    { method: 'PUT', path: '/api/v1/messages/question/active', body: { is_active: true } },
+  ])
 })
 
 it('creates a named branch from the selected message and switches to it', async () => {
@@ -173,4 +181,17 @@ it('copies the original Markdown source', async () => {
   render(<App />)
   await menuAction(user, 'Скопировать Markdown')
   expect(await navigator.clipboard.readText()).toBe(original.content)
+})
+
+
+/** A lost response leaves the UI stale; retry must resend the desired state. */
+it('keeps a message hidden when the first successful mask response is lost', async () => {
+  const requests = mockMessageApi({ loseMaskResponse: true })
+  const user = userEvent.setup()
+  render(<App />)
+  await menuAction(user, 'Скрыть из контекста')
+  expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось изменить маску сообщения.')
+  await menuAction(user, 'Скрыть из контекста')
+  expect(await screen.findByText('Вне контекста')).toBeVisible()
+  expect(requests.map(({ body }) => body)).toEqual([{ is_active: false }, { is_active: false }])
 })

@@ -1,6 +1,6 @@
 import type {
   AncestorMutationWarningResponse, BranchMergeResponse, BranchResponse, ChatResponse,
-  MessageResponse, RegenerateReplyResponse, RunTarget, ToggleActiveResponse,
+  MessageResponse, RegenerateReplyResponse, RunTarget, MessageActiveResponse,
 } from './types'
 
 const apiPrefix = '/api/v1'
@@ -54,7 +54,7 @@ function post<T>(path: string, body: object, signal?: AbortSignal): Promise<T> {
   return jsonRequest<T>(path, 'POST', body, signal)
 }
 
-function jsonRequest<T>(path: string, method: 'POST' | 'PATCH', body: object, signal?: AbortSignal): Promise<T> {
+function jsonRequest<T>(path: string, method: 'POST' | 'PATCH' | 'PUT', body: object, signal?: AbortSignal): Promise<T> {
   return request<T>(path, {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -92,8 +92,8 @@ export const api = {
   editMessage: (messageId: string, content: string, force: boolean) =>
     jsonRequest<MessageResponse>(`/messages/${encodeURIComponent(messageId)}`, 'PATCH', { content, force }),
 
-  toggleMessage: (messageId: string) =>
-    request<ToggleActiveResponse>(`/messages/${encodeURIComponent(messageId)}/toggle-active`, { method: 'POST' }),
+  setMessageActive: (messageId: string, isActive: boolean) =>
+    jsonRequest<MessageActiveResponse>(`/messages/${encodeURIComponent(messageId)}/active`, 'PUT', { is_active: isActive }),
 
   createBranch: (chatId: string, targetMessageId: string, name: string) =>
     post<BranchResponse>(`/chats/${encodeURIComponent(chatId)}/branches`, { target_message_id: targetMessageId, name }),

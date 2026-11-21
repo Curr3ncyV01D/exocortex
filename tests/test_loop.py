@@ -18,7 +18,7 @@ from src.config import settings
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
     BranchConflictError, branch_from_here, squash_merge_branch,
-    toggle_message_active, update_message_content,
+    set_message_active, update_message_content,
 )
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
@@ -151,7 +151,7 @@ async def test_turn_keeps_a_snapshot_for_context_and_memory_tools(file_sessions)
         if len(requests) == 1:
             async with file_sessions.begin() as writer:
                 await update_message_content(question_id, "Edited later", force=True, session=writer)
-                await toggle_message_active(archive_id, writer)
+                await set_message_active(archive_id, writer, is_active=False)
             return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
         return _make_text_response("Reply")
 

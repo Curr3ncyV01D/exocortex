@@ -11,7 +11,8 @@ from src.schemas import (
     MessageResponse,
     MessageUpdateContentRequest,
     SendMessageRequest,
-    ToggleActiveResponse,
+    MessageActiveRequest,
+    MessageActiveResponse,
 )
 
 router = APIRouter(tags=["messages"], responses={404: {"model": ErrorResponse}})
@@ -39,6 +40,6 @@ async def edit_message(message_id: str, payload: MessageUpdateContentRequest, se
     return await services.edit_message(session, message_id, payload.content, payload.force)
 
 
-@router.post("/messages/{message_id}/toggle-active", response_model=ToggleActiveResponse)
-async def toggle_message(message_id: str, session: SessionDep):
-    return await services.toggle_message(session, message_id)
+@router.put("/messages/{message_id}/active", response_model=MessageActiveResponse)
+async def set_message_active(message_id: str, payload: MessageActiveRequest, session: SessionDep):
+    return await services.set_message_active_state(session, message_id, payload.is_active)

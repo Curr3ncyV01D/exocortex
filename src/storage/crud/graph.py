@@ -253,15 +253,17 @@ async def update_message_content(
     return {"status": "success", "message_id": message_id}
 
 
-async def toggle_message_active(
+async def set_message_active(
     message_id: str,
     session: AsyncSession,
+    *,
+    is_active: bool,
 ) -> bool:
-    """Инвертирует флаг присутствия в контексте. Транзакцию завершает вызывающий код."""
+    """Устанавливает маску идемпотентно. Транзакцию завершает вызывающий код."""
     messages = Message.__table__
     new_state = await session.scalar(
         update(messages).where(messages.c.id == message_id)
-        .values(is_active=~messages.c.is_active).returning(messages.c.is_active)
+        .values(is_active=is_active).returning(messages.c.is_active)
     )
     if new_state is None:
         raise MessageNotFoundError(f"Сообщение {message_id} не найдено")

@@ -24,7 +24,7 @@ from src.storage.crud.graph import (
     read_context_from_head,
     reserve_branch_write,
     squash_merge_branch,
-    toggle_message_active,
+    set_message_active,
     update_message_content,
 )
 from src.storage.models import Branch, Chat, Message, MessageRole, MessageSubmission
@@ -225,7 +225,7 @@ async def edit_message(session: AsyncSession, message_id: str, content: str, for
     return message
 
 
-async def toggle_message(session: AsyncSession, message_id: str) -> dict[str, str | bool]:
+async def set_message_active_state(session: AsyncSession, message_id: str, is_active: bool) -> dict[str, str | bool]:
     async with session.begin():
-        is_active = await toggle_message_active(message_id, session)
+        is_active = await set_message_active(message_id, session, is_active=is_active)
     return {"message_id": message_id, "is_active": is_active}

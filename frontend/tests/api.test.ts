@@ -71,14 +71,14 @@ describe('REST API client', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await api.editMessage(message.id, '**текст**', true)
-    await api.toggleMessage(message.id)
+    await api.setMessageActive(message.id, false)
     await api.createBranch(chat.id, message.id, 'feature/notes')
 
     expect(fetchMock.mock.calls.map(([path, options]) => [
       path, options.method, options.body && JSON.parse(options.body),
     ])).toEqual([
       ['/api/v1/messages/question', 'PATCH', { content: '**текст**', force: true }],
-      ['/api/v1/messages/question/toggle-active', 'POST', undefined],
+      ['/api/v1/messages/question/active', 'PUT', { is_active: false }],
       ['/api/v1/chats/chat-1/branches', 'POST', { target_message_id: 'question', name: 'feature/notes' }],
     ])
   })

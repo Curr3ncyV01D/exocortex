@@ -254,7 +254,7 @@ flowchart TD
         A2["3.2. branch_from_here\n(Атомарное создание ветки)"]
         A3["3.3. update_message_content\n(Правка с Ancestor Check)"]
         A4["3.4. squash_merge_branch\n(Компрессия и слияние)"]
-        A5["3.5. toggle_message_active\n(Контекстное маскирование)"]
+        A5["3.5. set_message_active\n(Контекстное маскирование)"]
     end
 ```
 
@@ -346,15 +346,16 @@ flowchart TD
 
 ---
 
-### Алгоритм 3.5: Контекстное маскирование (`toggle_message_active`)
+### Алгоритм 3.5: Контекстное маскирование (`set_message_active`)
 **Назначение:** Мгновенное селективное включение/исключение реплики из контекста генерации LLM без деструктивного влияния на граф связей DAG.
 
 * **Входные параметры:**
   * `message_id: str` — идентификатор сообщения.
   * `session: AsyncSession` — сессия БД.
+  * `is_active: bool` — желаемое состояние видимости (именованный параметр).
 * **Инвариант:** Поле `updated_at` **не модифицируется**, так как операция не изменяет смыслового наполнения текста (`content`), а управляет состоянием видимости.
 
-Ядро инвертирует `is_active` одним SQL-запросом `UPDATE … RETURNING`. При отсутствии сообщения оно возвращает `MessageNotFoundError`. Вызывающий код фиксирует транзакцию.
+Ядро устанавливает переданное значение `is_active` одним SQL-запросом `UPDATE … RETURNING`. Повтор с тем же значением не меняет результат. При отсутствии сообщения оно возвращает `MessageNotFoundError`. Вызывающий код фиксирует транзакцию.
 
 ---
 
@@ -635,7 +636,11 @@ class MessageUpdateContentRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Новый текст сообщения")
     force: bool = Field(default=False, description="Принудительная правка разветвленного узла")
 
-class ToggleActiveResponse(BaseModel):
+class MessageActiveRequest(BaseModel):
+    is_active: bool = Field(strict=True)
+
+
+class MessageActiveResponse(BaseModel):
     message_id: str
     is_active: bool
 
@@ -690,10 +695,12 @@ class AncestorMutationWarningResponse(BaseModel):
 | `POST` | `/api/v1/branches/{branch_id}/run` | `RunTurnRequest` | `200 OK` → `MessageResponse`<br>`409 Conflict` (изменилась вершина или вопрос, нет ожидающего вопроса или ветка занята)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Генерирует ответ на сохранённый активный вопрос и добавляет его в конец полной цепочки. |
 | `POST` | `/api/v1/branches/{branch_id}/regenerate` | `RegenerateReplyRequest` | `201 Created` → `RegenerateReplyResponse`<br>`409 Conflict` (вершина изменилась, занято имя ветки, исходный вопрос скрыт или нет ответа для перегенерации)<br>`413 Payload Too Large` (реплика превышает бюджет)<br>`502 Bad Gateway` (сбой Gemini) | Создаёт форк от вопроса, на который был дан последний активный ответ, и запускает генерацию в новой ветке. |
 | `PATCH` | `/api/v1/messages/{message_id}` | `MessageUpdateContentRequest` | `200 OK` -> `MessageResponse`<br>`409 Conflict` -> `AncestorMutationWarningResponse` | In-place правка текста (Алгоритм 3.3). Требует `force=True` для предков. |
-| `POST` | `/api/v1/messages/{message_id}/toggle-active` | *None* | `200 OK` -> `ToggleActiveResponse` | Контекстное маскирование (Алгоритм 3.5). Инвертирует флаг `is_active`. |
+| `PUT` | `/api/v1/messages/{message_id}/active` | `MessageActiveRequest` | `200 OK` -> `MessageActiveResponse` | Устанавливает явный `is_active` (Алгоритм 3.5). Повтор запроса сохраняет указанное состояние; поле обязательно и принимает только JSON boolean. |
 
 С `include_inactive=true` скрытое сообщение сохраняет своё место в цепочке и возвращается с `is_active: false`. Флаг относится к сообщению и виден во всех ветках, которые его содержат. Параметр применяется только при чтении истории через API. Gemini по-прежнему получает активные сообщения (Алгоритм 3.1).
 
 Операции над отдельной веткой и сообщением возвращают `404`, если указанный объект отсутствует. Добавление реплики также может вернуть `409`, если конкурентная запись изменила вершину.
 
 Ключ `Idempotency-Key` действует в пределах ветки. Повтор с тем же ключом и исходным текстом возвращает существующую реплику с тем же ID и статусом `201`, даже если она была отредактирована или вершина ветки продвинулась. Повтор ключа с другим текстом возвращает `409`. Запись ключа и реплики фиксируется в одной транзакции. Запросы без ключа добавляют новую реплику.
+
+REST API предназначен для обращения с того же origin, что и интерфейс: Vite и Nginx проксируют `/api/`. Приложение не выдаёт разрешений CORS для сторонних origin. Это браузерное ограничение не заменяет аутентификацию и не защищает от прямых небраузерных запросов; локальный запуск сохраняет привязку опубликованного порта к `127.0.0.1`.
