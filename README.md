@@ -75,6 +75,7 @@ npm run dev
 
 ## Проверки
 
+- Единый локальный прогон — `.venv` Python с `scripts/check.py`; режимы `--e2e`, `--staged` и установка hook описаны в [инструкции локальных проверок](docs/how-to/checks.md).
 - Бэкенд из корня с активным окружением `.venv` — `python -m pytest`.
 - Фронтенд из `frontend/` — `npm test` и `npm run build`.
 - Сквозные проверки интерфейса, покрытия и локальный запуск — [руководство фронтенда](frontend/README.md).
