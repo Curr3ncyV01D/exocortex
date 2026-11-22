@@ -19,7 +19,7 @@ from src.storage.crud.graph import (
     branch_from_here,
     reconstruct_context,
     squash_merge_branch,
-    toggle_message_active,
+    set_message_active,
     update_message_content,
 )
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
@@ -89,7 +89,7 @@ async def test_duplicate_branch_from_stale_reader_uses_domain_error(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_mask_toggles_compose(
+async def test_mask_assignment_overrides_a_stale_session_state(
     file_sessions: async_sessionmaker[AsyncSession],
 ) -> None:
     async with file_sessions() as first:
@@ -97,8 +97,8 @@ async def test_concurrent_mask_toggles_compose(
         root = await first.get(Message, root_id)
         assert root is not None and root.is_active
         async with file_sessions.begin() as second:
-            assert await toggle_message_active(root_id, second) is False
-        assert await toggle_message_active(root_id, first) is True
+            assert await set_message_active(root_id, second, is_active=False) is False
+        assert await set_message_active(root_id, first, is_active=True) is True
         await first.commit()
 
     async with file_sessions() as session:
@@ -374,12 +374,12 @@ async def test_unmasked_message_before_merge_checkpoint_stays_out_of_delta(
     chat_id = initial_chat_setup["chat_id"]
     await branch_from_here(chat_id, initial_chat_setup["root_message_id"], "side", session)
     old = await append_message(chat_id, "side", MessageRole.USER, "Old", session)
-    await toggle_message_active(old.id, session)
+    await set_message_active(old.id, session, is_active=False)
     await append_message(chat_id, "side", MessageRole.USER, "First visible", session)
     summary = AsyncMock(return_value="Summary")
     await squash_merge_branch(chat_id, "side", summarizer_func=summary, session=session)
 
-    await toggle_message_active(old.id, session)
+    await set_message_active(old.id, session, is_active=True)
     assert old.id in {msg.id for msg in await reconstruct_context(chat_id, "side", session)}
     new = await append_message(chat_id, "side", MessageRole.USER, "New", session)
     summary.reset_mock()
@@ -452,21 +452,21 @@ async def test_db_rejects_cross_chat_graph_links(
 
 
 @pytest.mark.asyncio
-async def test_toggle_message_active_invariants(
+async def test_set_message_active_preserves_message_invariants(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
 ) -> None:
-    """Проверка тумблера видимости и инварианта неизменности updated_at (Алгоритм 3.5)."""
+    """Установка видимости сохраняет текст, связи и время последнего редактирования."""
     root_id = initial_chat_setup["root_message_id"]
 
-    new_state = await toggle_message_active(root_id, session)
+    new_state = await set_message_active(root_id, session, is_active=False)
     assert new_state is False
 
     msg = await session.get(Message, root_id)
     assert msg.is_active is False
     assert msg.updated_at is None
 
-    new_state = await toggle_message_active(root_id, session)
+    new_state = await set_message_active(root_id, session, is_active=True)
     assert new_state is True
 
 
@@ -638,7 +638,7 @@ async def test_squash_merge_second_incremental_merge(
     await session.refresh(branch)
     assert branch.last_merged_message_id == msg_b4_id
 
-    await toggle_message_active(res2["merge_message_id"], session)
+    await set_message_active(res2["merge_message_id"], session, is_active=False)
     await append_message(chat_id, branch.name, MessageRole.USER, "Step 5", session)
     mock_summarizer_3 = AsyncMock(return_value="Merge Summary 3")
     await squash_merge_branch(

@@ -29,7 +29,7 @@ export interface MessageResponse {
   updated_at: string | null
 }
 
-export interface ToggleActiveResponse {
+export interface MessageActiveResponse {
   message_id: string
   is_active: boolean
 }

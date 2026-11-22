@@ -1,9 +1,11 @@
+-c constraints.txt
+
 # --- Web Framework & Server ---
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
 # --- Database & Async ORM ---
-sqlalchemy>=2.0.36
+sqlalchemy[asyncio]>=2.0.36
 aiosqlite>=0.20.0
 alembic>=1.14.0
 
@@ -14,6 +16,7 @@ python-dotenv>=1.0.1
 
 # --- Google Gemini Official SDK ---
 google-genai>=0.1.1
+httpx2>=2.16.2
 
 # --- Testing & Async Test Client (TDD) ---
 pytest>=8.3.3

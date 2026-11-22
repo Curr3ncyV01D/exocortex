@@ -2,7 +2,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.agent.loop import BranchBusyError, LLMGenerationError, PromptTooLargeError
@@ -18,20 +17,20 @@ from src.storage.crud.graph import (
     MessageNotFoundError,
     NoActiveMessagesToMergeError,
 )
-from src.storage.database import engine, init_db
+from src.storage.database import engine
+from src.storage.migrations import require_current_schema
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
-        await init_db(engine)
+        await require_current_schema(engine)
         yield
     finally:
         await engine.dispose()
 
 
 app = FastAPI(title="ExoCortex", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(router)
 
 _ERROR_STATUS: dict[type[Exception], int] = {

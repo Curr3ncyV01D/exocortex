@@ -25,7 +25,7 @@ function mockConversation(overrides: {
     const path = new URL(url, 'http://test').pathname
     if (path === '/api/v1/chats') return Response.json([chat])
     if (path === `/api/v1/chats/${chat.id}/branches`) return Response.json([main, side])
-    const [, messageId] = path.match(/\/messages\/([^/]+)(?:\/toggle-active)?$/) ?? []
+    const [, messageId] = path.match(/\/messages\/([^/]+)(?:\/active)?$/) ?? []
     if (messageId) {
       const message = histories[main.id].find(({ id }) => id === messageId)
       if (!message) throw new Error(`Unknown message: ${messageId}`)
@@ -34,7 +34,7 @@ function mockConversation(overrides: {
         message.is_edited = true
         return Response.json(message)
       }
-      message.is_active = !message.is_active
+      message.is_active = (JSON.parse(String(options.body)) as { is_active: boolean }).is_active
       return Response.json({ message_id: messageId, is_active: message.is_active })
     }
     const [, branchId, action] = path.match(/\/branches\/([^/]+)\/(timeline|messages|run)$/) ?? []

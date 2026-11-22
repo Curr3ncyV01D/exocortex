@@ -1,16 +1,17 @@
 import asyncio
 import json
-import logging
 import time
 from bisect import bisect_right
 from collections.abc import Callable
 from typing import Any, Optional
+from uuid import uuid4
 
 from google.genai import types
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient, ToolCall, map_messages_to_gemini
+from src.agent.diagnostics import describe_failure, logger, operation_scope
 from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
 from src.agent.tools import (
     get_branch_summary,
@@ -30,8 +31,6 @@ from src.storage.crud.graph import (
 from src.storage.models import Message, MessageRole
 
 _branch_locks: dict[str, asyncio.Lock] = {}
-logger = logging.getLogger(__name__)
-TURN_TIMEOUT_SECONDS = 90
 MAX_TOOL_CALLS = 12
 
 
@@ -123,7 +122,7 @@ async def run_turn(
     client: GeminiClient,
     session: AsyncSession,
     user_prompt: Optional[str] = None,
-    max_iterations: int = 3,
+    max_iterations: int = 8,
     *,
     expected_head_id: Optional[str] = None,
     expected_question_id: Optional[str] = None,
@@ -133,13 +132,19 @@ async def run_turn(
         raise ValueError("Для генерации требуется выделенная сессия без открытой транзакции.")
     if user_prompt is not None and not user_prompt.strip():
         raise ValueError("Промпт должен содержать текст.")
+    turn_id = uuid4().hex
+    timeout = settings.AGENT_OPERATION_TIMEOUT_SECONDS
+    turn_timeout = asyncio.timeout(timeout)
     try:
-        async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
-            return await _run_turn(
-                chat_id, branch_name, client, session, user_prompt, max_iterations,
-                expected_head_id, expected_question_id,
-            )
+        with operation_scope(turn_id, timeout):
+            async with turn_timeout:
+                return await _run_turn(
+                    chat_id, branch_name, client, session, user_prompt, max_iterations,
+                    expected_head_id, expected_question_id, turn_id,
+                )
     except TimeoutError as exc:
+        if turn_timeout.expired():
+            logger.warning("gemini_turn_timeout turn_id=%s limit_seconds=%.1f", turn_id, timeout)
         raise LLMGenerationError("Истёк лимит времени на генерацию хода.") from exc
     finally:
         if session.in_transaction():
@@ -155,6 +160,7 @@ async def _run_turn(
     max_iterations: int,
     expected_head_id: str | None,
     expected_question_id: str | None,
+    turn_id: str,
 ) -> Message:
     branch = await get_branch(chat_id, branch_name, session, refresh=True)
     if not branch:
@@ -208,7 +214,8 @@ async def _run_turn(
                 raise BranchConflictError("Ожидающий вопрос изменился. Проверьте историю ветки.")
             contents, active_ids = _context_window(timeline, budget, timeline.index(question))
             final_text, trace = await _generate_from_snapshot(
-                chat_id, client, snapshot, contents, active_ids, budget, max_iterations, head_id=head_id,
+                chat_id, client, snapshot, contents, active_ids, budget, max_iterations,
+                head_id=head_id, turn_id=turn_id,
             )
 
         reply_metadata = {"reply_to_message_id": question_id, "execution_trace": trace}
@@ -239,15 +246,23 @@ async def _generate_from_snapshot(
     max_iterations: int,
     *,
     head_id: str | None,
+    turn_id: str,
 ) -> tuple[str, dict[str, Any]]:
     async def generate(
         tools: list[Callable[..., Any]] | None,
+        phase: str,
     ) -> types.GenerateContentResponse:
+        started_at = time.perf_counter()
         try:
             return await client.generate_step(contents=contents, tools=tools)
-        except TimeoutError:
-            raise
         except Exception as exc:
+            logger.warning(
+                "gemini_request_failed turn_id=%s phase=%s model=%s context_bytes=%d elapsed_ms=%.0f %s",
+                turn_id, phase, client.model_name, _contents_size(contents),
+                (time.perf_counter() - started_at) * 1000, describe_failure(exc),
+            )
+            if isinstance(exc, TimeoutError):
+                raise
             raise LLMGenerationError("Сбой вызова Gemini.") from exc
 
     async def search_history(
@@ -292,8 +307,8 @@ async def _generate_from_snapshot(
     iterations_used = 0
     final_text: Optional[str] = None
 
-    for _ in range(max_iterations):
-        response = await generate(tools_list)
+    for iteration in range(max_iterations):
+        response = await generate(tools_list, "initial" if iteration == 0 else "after_tools")
         function_calls = client.extract_function_calls(response)
         if not function_calls:
             final_text = client.extract_response_text(response)
@@ -306,6 +321,8 @@ async def _generate_from_snapshot(
 
         for call in function_calls:
             tool_name, tool_args = call.name, call.arguments
+            known_tool = tool_name if tool_name in tool_registry else "unknown"
+            outcome = "ok"
             step_start = time.perf_counter()
             call_sig = (
                 tool_name,
@@ -313,21 +330,32 @@ async def _generate_from_snapshot(
             )
 
             if call_sig in seen_calls:
+                outcome = "duplicate"
                 output_str = (
                     "ОШИБКА: Повторный вызов инструмента с идентичными "
                     "аргументами заблокирован. Измени запрос или ответь пользователю."
                 )
             elif tool_name not in tool_registry:
+                outcome = "unknown_tool"
                 output_str = f"Ошибка: неизвестный инструмент '{tool_name}'."
             else:
                 seen_calls.add(call_sig)
+                logger.info("gemini_tool_started turn_id=%s tool=%s", turn_id, known_tool)
                 try:
                     output_str = await tool_registry[tool_name](**tool_args)
-                except Exception:
-                    logger.exception("Сбой инструмента %s", tool_name)
+                except Exception as exc:
+                    outcome = "failed"
+                    logger.warning(
+                        "gemini_tool_failed turn_id=%s tool=%s error_type=%s",
+                        turn_id, known_tool, type(exc).__name__,
+                    )
                     output_str = "Ошибка выполнения инструмента. Продолжи без его результата."
 
             step_duration_ms = round((time.perf_counter() - step_start) * 1000, 2)
+            logger.info(
+                "gemini_tool_finished turn_id=%s tool=%s outcome=%s elapsed_ms=%.0f",
+                turn_id, known_tool, outcome, step_duration_ms,
+            )
             tool_results.append((call, output_str))
 
             summary_preview = (
@@ -347,7 +375,12 @@ async def _generate_from_snapshot(
 
         next_contents = contents.copy()
         client.append_tool_interaction(next_contents, response, tool_results)
-        if _contents_size(next_contents) > budget:
+        next_bytes = _contents_size(next_contents)
+        if next_bytes > budget:
+            logger.warning(
+                "gemini_tool_context_over_budget turn_id=%s context_bytes=%d budget_bytes=%d",
+                turn_id, next_bytes, budget,
+            )
             break
         contents = next_contents
 
@@ -356,9 +389,12 @@ async def _generate_from_snapshot(
         client.append_user_text(fallback_contents, FALLBACK_MAX_ITERATIONS_PROMPT)
         if _contents_size(fallback_contents) <= budget:
             contents = fallback_contents
-        final_text = client.extract_response_text(await generate(None))
+        response = await generate(None, "fallback")
+        final_text = client.extract_response_text(response)
 
     if not final_text:
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        logger.warning("gemini_empty_response turn_id=%s finish_reason=%s", turn_id, finish_reason)
         raise LLMGenerationError(
             "Модель не вернула завершённый текстовый ответ."
         )

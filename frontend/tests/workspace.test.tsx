@@ -46,7 +46,8 @@ it('shows the main timeline, renders Markdown and keeps masked messages in order
   expect(screen.getByRole('combobox', { name: 'Ветка' })).toHaveValue(main.id)
 })
 
-it('reveals older pages on upward scroll and resets when selecting a branch', async () => {
+/** Use deterministic geometry because jsdom does not lay out the scroll container. */
+async function renderLongTimeline() {
   const history: MessageResponse[] = Array.from({ length: 85 }, (_, index) => ({
     ...timeline[0],
     id: String(index + 1),
@@ -65,51 +66,79 @@ it('reveals older pages on upward scroll and resets when selecting a branch', as
     ['/api/v1/branches/' + main.id + '/run']: () => Response.json(reply),
   })
   render(<App />)
-
-  const list = () => within(screen.getByRole('list', { name: 'История сообщений' }))
   await screen.findByText('Реплика 85')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 46')
-  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
-
-  const scrollArea = screen.getByRole('list', { name: 'История сообщений' })
-    .closest<HTMLDivElement>('[data-timeline-scroll]')!
-  Object.defineProperty(scrollArea, 'scrollHeight', { get: () => list().getAllByRole('listitem').length * 70 })
+  const list = screen.getByRole('list', { name: 'История сообщений' })
+  const scrollArea = list.closest<HTMLDivElement>('[data-timeline-scroll]')!
+  Object.defineProperty(scrollArea, 'scrollHeight', {
+    get: () => (scrollArea.querySelector('ol[aria-label="История сообщений"]')?.childElementCount ?? 0) * 70,
+  })
   const scrollTo = (top: number) => {
     scrollArea.scrollTop = top
     fireEvent.scroll(scrollArea)
   }
+  return { mock, list, scrollArea, scrollTo }
+}
+
+/** Reveal only on upward threshold crossings and preserve the reading position. */
+it('reveals older pages on upward scroll without requesting the history again', async () => {
+  const { mock, list, scrollArea, scrollTo } = await renderLongTimeline()
+  const cards = () => list.children
+  expect(cards()).toHaveLength(40)
+  expect(cards()[0]).toHaveTextContent('Реплика 46')
+  expect(within(list).queryByText('Реплика 45')).not.toBeInTheDocument()
+
   const requestsBeforeReveal = mock.mock.calls.length
   scrollTo(100)
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(cards()).toHaveLength(40)
   scrollTo(800)
   scrollTo(251)
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
+  expect(cards()).toHaveLength(40)
   scrollTo(250)
-  expect(list().getAllByRole('listitem')).toHaveLength(80)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 6')
+  expect(cards()).toHaveLength(80)
+  expect(cards()[0]).toHaveTextContent('Реплика 6')
   expect(scrollArea.scrollTop).toBe(250 + 40 * 70)
   fireEvent.scroll(scrollArea)
-  expect(list().getAllByRole('listitem')).toHaveLength(80)
+  expect(cards()).toHaveLength(80)
   scrollTo(120)
-  expect(list().getAllByRole('listitem')).toHaveLength(85)
-  expect(list().getAllByRole('listitem')[0]).toHaveTextContent('Реплика 1')
-  expect(screen.queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
+  expect(cards()).toHaveLength(85)
+  expect(within(scrollArea).queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
   expect(mock).toHaveBeenCalledTimes(requestsBeforeReveal)
+})
 
-  await userEvent.click(screen.getByRole('button', { name: /^Run$/ }))
+/** A generated answer must not discard messages already revealed in this branch. */
+it('keeps the expanded history after appending a generated answer', async () => {
+  const { list, scrollTo } = await renderLongTimeline()
+  scrollTo(800)
+  scrollTo(250)
+  scrollTo(120)
+  expect(list.children).toHaveLength(85)
+
+  const composer = screen.getByRole('form', { name: 'Ввод сообщения' })
+  await userEvent.click(within(composer).getByRole('button', { name: /^Run$/ }))
   expect(await screen.findByText('Новый ответ')).toBeVisible()
-  expect(list().getAllByRole('listitem')).toHaveLength(86)
+  expect(list.children).toHaveLength(86)
+  expect(list.children[0]).toHaveTextContent('Реплика 1')
+})
+
+/** Switching branches starts each selected timeline at its own latest page. */
+it('resets expanded pages when switching away from a branch and back', async () => {
+  const { list, scrollTo } = await renderLongTimeline()
+  scrollTo(800)
+  scrollTo(250)
+  expect(list.children).toHaveLength(80)
 
   const branchPicker = screen.getByRole('combobox', { name: 'Ветка' })
   await userEvent.selectOptions(branchPicker, side.id)
   await screen.findByText('Реплика 45')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().queryByText('Реплика 5')).not.toBeInTheDocument()
+  const sideHistory = screen.getByRole('list', { name: 'История сообщений' })
+  expect(sideHistory.children).toHaveLength(40)
+  expect(within(sideHistory).queryByText('Реплика 5')).not.toBeInTheDocument()
+
   await userEvent.selectOptions(branchPicker, main.id)
   await screen.findByText('Реплика 85')
-  expect(list().getAllByRole('listitem')).toHaveLength(40)
-  expect(list().queryByText('Реплика 45')).not.toBeInTheDocument()
+  const mainHistory = screen.getByRole('list', { name: 'История сообщений' })
+  expect(mainHistory.children).toHaveLength(40)
+  expect(within(mainHistory).queryByText('Реплика 45')).not.toBeInTheDocument()
 })
 
 /** A slow reply from the previous branch must not replace the selected history. */

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent import tools
 from src.agent.tools import get_branch_summary, search_history_fts
-from src.storage.crud.graph import toggle_message_active, update_message_content
+from src.storage.crud.graph import set_message_active, update_message_content
 from src.storage.models import Branch, BranchStatus, Chat, MergeEvent, Message, MessageRole
 
 
@@ -116,7 +116,7 @@ async def test_chat_overview_counts_active_history_and_checks_latest_summary(
     assert "разбор/Первая ветка (merged) — последняя сводка скрыта" in overview
     assert "чужая ветка" not in overview
 
-    await toggle_message_active(new_summary.id, session)
+    await set_message_active(new_summary.id, session, is_active=True)
     refreshed = await tools.get_chat_overview(chat_id, session=session)
     assert "Активных сообщений: 3" in refreshed
     assert "разбор/Первая ветка (merged) — сводка доступна" in refreshed
@@ -403,10 +403,10 @@ async def test_get_branch_summary_returns_latest(
     assert "Срез 2: Финальные выводы архитектуры" in summary
     assert "Срез 1" not in summary
 
-    await toggle_message_active(event2.id, session)
+    await set_message_active(event2.id, session, is_active=False)
     summary = await get_branch_summary(chat_id, "feature/test", session)
     assert summary == "Актуальная сводка для ветки скрыта из контекста."
-    await toggle_message_active(event2.id, session)
+    await set_message_active(event2.id, session, is_active=True)
     assert "Срез 2" in await get_branch_summary(chat_id, "feature/test", session)
 
 
@@ -507,7 +507,7 @@ async def test_search_history_fts_sync_after_edit_and_toggle(
     )
     assert "FastAPI" in res_new
 
-    await toggle_message_active(msg_id, session)
+    await set_message_active(msg_id, session, is_active=False)
 
     res_disabled = await search_history_fts(
         chat_id=chat_id,

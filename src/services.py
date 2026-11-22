@@ -1,10 +1,15 @@
 import json
+import time
+import asyncio
+from uuid import uuid4
 from hashlib import sha256
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agent.client import GeminiClient
+from src.agent.diagnostics import describe_failure, logger, operation_id, operation_scope
+from src.config import settings
 from src.agent.loop import LLMGenerationError, run_turn
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
@@ -19,7 +24,7 @@ from src.storage.crud.graph import (
     read_context_from_head,
     reserve_branch_write,
     squash_merge_branch,
-    toggle_message_active,
+    set_message_active,
     update_message_content,
 )
 from src.storage.models import Branch, Chat, Message, MessageRole, MessageSubmission
@@ -175,11 +180,23 @@ async def regenerate_reply(
 
 
 async def _summarize(client: GeminiClient, delta: list[Message], previous_summary: str | None) -> str:
+    with operation_scope(uuid4().hex, settings.AGENT_OPERATION_TIMEOUT_SECONDS):
+        return await _summarize_in_operation(client, delta, previous_summary)
+
+
+async def _summarize_in_operation(client: GeminiClient, delta: list[Message], previous_summary: str | None) -> str:
+    started_at = time.perf_counter()
     try:
-        summary = await client.summarize_delta(delta, previous_summary)
+        async with asyncio.timeout(settings.AGENT_OPERATION_TIMEOUT_SECONDS):
+            summary = await client.summarize_delta(delta, previous_summary)
     except Exception as exc:
+        logger.warning(
+            "gemini_request_failed turn_id=%s phase=summarize model=%s messages=%d elapsed_ms=%.0f %s",
+            operation_id.get(), client.model_name, len(delta), (time.perf_counter() - started_at) * 1000, describe_failure(exc),
+        )
         raise LLMGenerationError("Сбой суммаризации Gemini.") from exc
     if not summary.strip():
+        logger.warning("gemini_empty_response turn_id=%s phase=summarize model=%s messages=%d", operation_id.get(), client.model_name, len(delta))
         raise LLMGenerationError("Gemini не вернул завершённую выжимку.")
     return summary
 
@@ -208,7 +225,7 @@ async def edit_message(session: AsyncSession, message_id: str, content: str, for
     return message
 
 
-async def toggle_message(session: AsyncSession, message_id: str) -> dict[str, str | bool]:
+async def set_message_active_state(session: AsyncSession, message_id: str, is_active: bool) -> dict[str, str | bool]:
     async with session.begin():
-        is_active = await toggle_message_active(message_id, session)
+        is_active = await set_message_active(message_id, session, is_active=is_active)
     return {"message_id": message_id, "is_active": is_active}

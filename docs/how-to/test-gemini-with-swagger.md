@@ -18,7 +18,7 @@
    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 
-4. Запусти сервер. При старте он инициализирует SQLite. Перезапускай сервер после изменения `.env`.
+4. [Подготовь SQLite](migrate-sqlite.md) и запусти сервер. Перезапускай его после изменения `.env`.
 
    ```powershell
    .\.venv\Scripts\python.exe -m uvicorn src.main:app --host 127.0.0.1 --port 8000

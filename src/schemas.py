@@ -136,7 +136,11 @@ class RegenerateReplyResponse(BaseModel):
     message: MessageResponse
 
 
-class ToggleActiveResponse(BaseModel):
+class MessageActiveRequest(BaseModel):
+    is_active: bool = Field(strict=True)
+
+
+class MessageActiveResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     message_id: str

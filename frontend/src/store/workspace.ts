@@ -280,7 +280,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
     toggleMessage(message) {
       return mutateMessage(message, async () => {
-        const result = await api.toggleMessage(message.id)
+        const result = await api.setMessageActive(message.id, !message.is_active)
         return (current) => ({ ...current, is_active: result.is_active })
       })
     },

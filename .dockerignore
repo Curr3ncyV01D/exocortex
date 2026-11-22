@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!requirements.txt
+!constraints.txt
+!alembic.ini
+!migrations/
+!migrations/**
+!scripts/
+!scripts/**
+!src/
+!src/**
+**/__pycache__/
+**/.env*

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.exc import OperationalError
 from google.genai import types
+from google.genai.errors import ServerError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -17,7 +18,7 @@ from src.config import settings
 from src.storage.crud.chats import append_message
 from src.storage.crud.graph import (
     BranchConflictError, branch_from_here, squash_merge_branch,
-    toggle_message_active, update_message_content,
+    set_message_active, update_message_content,
 )
 from src.storage.models import Branch, Chat, MergeEvent, Message, MessageRole
 from tests.conftest import create_initial_chat
@@ -67,11 +68,11 @@ async def test_turn_deadline_releases_lock_and_keeps_question(
             await asyncio.sleep(1)
 
         client.generate_step = AsyncMock(side_effect=slow_generation)
-        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 0.25)
+        monkeypatch.setattr(settings, "AGENT_OPERATION_TIMEOUT_SECONDS", 0.25)
         with pytest.raises(LLMGenerationError, match="лимит времени"):
             await run_turn(chat_id, "main", client, session, "Question")
         assert not session.in_transaction()
-        monkeypatch.setattr("src.agent.loop.TURN_TIMEOUT_SECONDS", 90)
+        monkeypatch.setattr(settings, "AGENT_OPERATION_TIMEOUT_SECONDS", 1800)
         client.generate_step = AsyncMock(return_value=_make_text_response("Recovered"))
         answer = await run_turn(chat_id, "main", client, session)
         question = await session.get(Message, answer.parent_id)
@@ -94,14 +95,15 @@ async def test_turn_budget_rejects_oversized_latest_message(session, initial_cha
 async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_fts(
     session: AsyncSession, initial_chat_setup: dict[str, str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An oversized historical message remains discoverable as a bounded tool result."""
     chat_id = initial_chat_setup["chat_id"]
-    await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 200, session)
-    orphan = await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
+    archived = await append_message(chat_id, "main", MessageRole.USER, "ArchiveMarker " * 600, session)
+    await append_message(chat_id, "main", MessageRole.MODEL, "OrphanMarker", session)
     hot_text = "Последний вопрос об ArchiveMarker"
     latest = await append_message(chat_id, "main", MessageRole.USER, hot_text, session)
     latest_id = latest.id
-    budget = _contents_size(map_messages_to_gemini([orphan, latest])) + 1500
-    # Make the older message larger than the remaining budget even before the orphan is removed.
+    budget = 4096
+    assert _contents_size(map_messages_to_gemini([archived])) > budget
     await session.commit()
     monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", budget)
     requests = []
@@ -121,6 +123,7 @@ async def test_sliding_window_keeps_recent_messages_and_recovers_old_ones_with_f
     assert [item.role for item in requests[0]] == ["user"]
     assert [part.text for part in requests[0][0].parts] == [hot_text]
     tool_result = requests[1][-1].parts[0].function_response
+    assert tool_result is not None
     assert "ArchiveMarker" in tool_result.response["result"]
     assert hot_text not in tool_result.response["result"]
     assert all(_contents_size(request) <= budget for request in requests)
@@ -148,7 +151,7 @@ async def test_turn_keeps_a_snapshot_for_context_and_memory_tools(file_sessions)
         if len(requests) == 1:
             async with file_sessions.begin() as writer:
                 await update_message_content(question_id, "Edited later", force=True, session=writer)
-                await toggle_message_active(archive_id, writer)
+                await set_message_active(archive_id, writer, is_active=False)
             return _make_tool_call_response([("search_history", {"query": "ArchiveMarker"})])
         return _make_text_response("Reply")
 
@@ -450,6 +453,26 @@ async def test_run_turn_loop_guard_blocks_duplicate_calls(
 
 
 @pytest.mark.asyncio
+async def test_default_turn_allows_eight_tool_rounds_then_synthesizes(
+    session: AsyncSession, initial_chat_setup: dict[str, str],
+) -> None:
+    """Eight distinct calls finish with one final response without tools."""
+    from src.agent.prompts import FALLBACK_MAX_ITERATIONS_PROMPT
+
+    client = GeminiClient(api_key="test-key")
+    client.generate_step = AsyncMock(side_effect=[
+        *[_make_tool_call_response([("get_summary", {"branch_name": f"branch-{i}"})]) for i in range(8)],
+        _make_text_response("Подтверждённых сведений о решении в истории нет."),
+    ])
+    answer = await run_turn(initial_chat_setup["chat_id"], "main", client, session)
+    assert client.generate_step.await_count == 9
+    assert client.generate_step.await_args.kwargs["tools"] is None
+    final_history = client.generate_step.await_args.kwargs["contents"]
+    assert any(part.text == FALLBACK_MAX_ITERATIONS_PROMPT for part in final_history[-1].parts)
+    assert json.loads(answer.metadata_json)["execution_trace"]["iterations_used"] == 8
+
+
+@pytest.mark.asyncio
 async def test_run_turn_max_iterations_fallback(
     session: AsyncSession,
     initial_chat_setup: dict[str, str],
@@ -694,7 +717,7 @@ async def test_run_turn_empty_or_blocked_model_response_raises_error(
 
 
 @pytest.mark.asyncio
-async def test_tool_failure_keeps_database_details_in_local_logs(
+async def test_tool_failure_logs_type_without_database_payload(
     session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
 ) -> None:
     details = OperationalError("SELECT local_marker", {"param": "private_marker"}, RuntimeError())
@@ -713,9 +736,45 @@ async def test_tool_failure_keeps_database_details_in_local_logs(
     trace = json.loads(answer.metadata_json)["execution_trace"]["steps"][0]
     assert "Ошибка" in output
     assert trace["output_summary"] == output
+    assert "gemini_tool_failed" in caplog.text
+    assert "tool=search_history error_type=OperationalError" in caplog.text
     for marker in ("local_marker", "private_marker"):
         assert marker not in output
-        assert marker in caplog.text
+        assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_after_history_lookup_is_correlated_with_the_tool(
+    session: AsyncSession, initial_chat_setup: dict[str, str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real local lookup completes before the mocked provider rejects the next round."""
+    chat_id = initial_chat_setup["chat_id"]
+    archived = Message(chat_id=chat_id, role=MessageRole.USER, content="PrivateArchiveMarker")
+    session.add(archived)
+    await session.commit()
+    caplog.set_level("INFO", logger="uvicorn.error.exocortex")
+    failure = ServerError(503, {"error": {"status": "UNAVAILABLE", "message": "private-provider-body"}})
+    client = GeminiClient(api_key="private-key", model_name="test-model")
+    client.generate_step = AsyncMock(side_effect=[
+        _make_tool_call_response([("search_history", {"query": "PrivateArchiveMarker"})]),
+        failure,
+    ])
+    with pytest.raises(LLMGenerationError, match="Сбой вызова Gemini") as caught:
+        await run_turn(chat_id, "main", client, session)
+
+    assert caught.value.__cause__ is failure
+    followup = client.generate_step.await_args.kwargs["contents"][-1]
+    assert "PrivateArchiveMarker" in followup.parts[0].function_response.response["result"]
+    started_log, tool_log, failure_log = [
+        record.getMessage() for record in caplog.records if record.name == "uvicorn.error.exocortex"
+    ]
+    assert "gemini_tool_started" in started_log
+    assert "tool=search_history outcome=ok" in tool_log
+    assert started_log.split()[1] == tool_log.split()[1] == failure_log.split()[1]
+    assert "phase=after_tools model=test-model" in failure_log
+    assert "kind=provider_http upstream_http=503 upstream_status=UNAVAILABLE" in failure_log
+    assert "private-provider-body" in caplog.text
+    assert all(marker not in caplog.text for marker in ("PrivateArchiveMarker", "private-key"))
 
 
 @pytest.mark.asyncio

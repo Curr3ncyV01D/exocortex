@@ -2,13 +2,14 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+from google.genai.errors import ServerError
 from httpx import AsyncClient
 
 from src.config import settings
 from src.agent.loop import run_turn
 from src.schemas import (
     AncestorMutationWarningResponse, BranchResponse, ChatResponse,
-    MessageResponse, RegenerateReplyResponse, ToggleActiveResponse,
+    MessageResponse, RegenerateReplyResponse, MessageActiveResponse,
 )
 from src.storage.crud.chats import append_message
 from src.storage.models import MessageRole
@@ -130,9 +131,9 @@ async def test_edit_warning_force_and_mask(api_client: AsyncClient) -> None:
     assert edited.status_code == 200
     dto = MessageResponse.model_validate(edited.json())
     assert dto.is_edited and dto.content == "Edited"
-    masked = await api_client.post(f"{url}/toggle-active")
+    masked = await api_client.put(f"{url}/active", json={"is_active": False})
     assert masked.status_code == 200
-    assert ToggleActiveResponse.model_validate(masked.json()).is_active is False
+    assert MessageActiveResponse.model_validate(masked.json()).is_active is False
     assert (await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json() == []
 
 
@@ -148,8 +149,8 @@ async def test_timeline_includes_masked_messages_on_request(api_client: AsyncCli
     hidden = await append_api_message(api_client, main.id, "Masked")
     latest = await append_api_message(api_client, main.id, "Latest")
     timeline_url = f"/api/v1/branches/{main.id}/timeline"
-    toggle_url = f"/api/v1/messages/{hidden.id}/toggle-active"
-    assert (await api_client.post(toggle_url)).status_code == 200
+    active_url = f"/api/v1/messages/{hidden.id}/active"
+    assert (await api_client.put(active_url, json={"is_active": False})).status_code == 200
 
     for params in ({}, {"include_inactive": "false"}):
         active = await api_client.get(timeline_url, params=params)
@@ -165,7 +166,7 @@ async def test_timeline_includes_masked_messages_on_request(api_client: AsyncCli
     assert messages[1].content == hidden.content
     assert messages[2].parent_id == hidden.id
 
-    assert (await api_client.post(toggle_url)).status_code == 200
+    assert (await api_client.put(active_url, json={"is_active": True})).status_code == 200
     restored = await api_client.get(timeline_url)
     assert restored.status_code == 200
     assert [(row["id"], row["is_active"]) for row in restored.json()] == [
@@ -192,7 +193,7 @@ async def test_run_excludes_messages_visible_only_in_full_timeline(
     _, main = await create_api_chat(api_client)
     hidden = await append_api_message(api_client, main.id, "Masked prompt")
     latest = await append_api_message(api_client, main.id, "Active prompt")
-    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{hidden.id}/active", json={"is_active": False})).status_code == 200
 
     url = f"/api/v1/branches/{main.id}"
     full = await api_client.get(f"{url}/timeline", params={"include_inactive": "true"})
@@ -215,6 +216,31 @@ async def test_merge_empty_delta(api_client, api_gemini):
     assert created.status_code == 201
     assert (await api_client.post(f"/api/v1/branches/{created.json()['id']}/merge", json={})).status_code == 400
     api_gemini.summarize_delta.assert_not_awaited()
+
+
+async def test_merge_provider_failure_returns_502_and_logs_upstream_status(
+    api_client: AsyncClient, api_gemini, caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat, main = await create_api_chat(api_client)
+    root = await append_api_message(api_client, main.id, "Question")
+    fork = await api_client.post(f"/api/v1/chats/{chat.id}/branches", json={
+        "name": "side", "target_message_id": root.id,
+    })
+    assert fork.status_code == 201
+    branch_id = fork.json()["id"]
+    await append_api_message(api_client, branch_id, "private-branch-text")
+    api_gemini.summarize_delta.side_effect = ServerError(
+        503, {"error": {"status": "UNAVAILABLE", "message": "private-provider-body"}},
+    )
+
+    response = await api_client.post(f"/api/v1/branches/{branch_id}/merge", json={})
+
+    assert response.status_code == 502
+    assert "phase=summarize" in caplog.text
+    assert "upstream_http=503 upstream_status=UNAVAILABLE" in caplog.text
+    assert "private-provider-body" not in response.text
+    assert "private-provider-body" in caplog.text
+    assert "private-branch-text" not in caplog.text
 
 
 async def test_run_rejects_stale_head(api_client, api_gemini):
@@ -260,13 +286,13 @@ async def test_missing_chat_branch_and_message(api_client):
     assert response.status_code == 404
 
 
-async def test_run_requires_active_user_head(api_client, api_gemini):
+async def test_run_requires_pending_active_user_question(api_client, api_gemini):
     _, main = await create_api_chat(api_client)
     run_url = f"/api/v1/branches/{main.id}/run"
     assert (await api_client.post(run_url, json={})).status_code == 409
     first = await append_api_message(api_client, main.id, "Question")
-    toggle_url = f"/api/v1/messages/{first.id}/toggle-active"
-    assert (await api_client.post(toggle_url)).status_code == 200
+    active_url = f"/api/v1/messages/{first.id}/active"
+    assert (await api_client.put(active_url, json={"is_active": False})).status_code == 200
     assert (await api_client.post(run_url, json={})).status_code == 409
     api_gemini.generate_step.assert_not_awaited()
 
@@ -277,7 +303,7 @@ async def test_run_checks_active_question_separately_from_head(api_client: Async
     question = await append_api_message(api_client, main.id, "Question")
     hidden = await append_api_message(api_client, main.id, "Hidden head")
     branch_url = f"/api/v1/branches/{main.id}"
-    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{hidden.id}/active", json={"is_active": False})).status_code == 200
     run = await api_client.post(f"{branch_url}/run", json={
         "expected_head_id": hidden.id, "expected_question_id": hidden.id,
     })
@@ -294,15 +320,15 @@ async def test_run_checks_active_question_separately_from_head(api_client: Async
     assert (await api_client.post(f"{branch_url}/run", json={})).status_code == 409
 
     # Hiding the recorded question must not redirect regeneration to another ancestor.
-    assert (await api_client.post(f"/api/v1/messages/{question.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{question.id}/active", json={"is_active": False})).status_code == 200
     response = await api_client.post(f"{branch_url}/regenerate", json={
         "expected_head_id": answer.id, "new_branch_name": "retry",
     })
     assert response.status_code == 409
     assert "Верните" in response.json()["detail"]
-    assert (await api_client.post(f"/api/v1/messages/{question.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{question.id}/active", json={"is_active": True})).status_code == 200
     suffix = await append_api_message(api_client, main.id, "Hidden suffix")
-    assert (await api_client.post(f"/api/v1/messages/{suffix.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{suffix.id}/active", json={"is_active": False})).status_code == 200
     response = await api_client.post(f"{branch_url}/regenerate", json={
         "expected_head_id": suffix.id, "new_branch_name": "retry",
     })
@@ -327,7 +353,7 @@ async def test_run_keeps_pending_question_after_merge(api_client, api_gemini, mo
     merge = await api_client.post(f"/api/v1/branches/{side.id}/merge", json={})
     assert merge.status_code == 200, merge.text
     hidden = await append_api_message(api_client, main.id, "Masked after merge")
-    assert (await api_client.post(f"/api/v1/messages/{hidden.id}/toggle-active")).status_code == 200
+    assert (await api_client.put(f"/api/v1/messages/{hidden.id}/active", json={"is_active": False})).status_code == 200
     monkeypatch.setattr(settings, "MAX_CONTEXT_BYTES", 1200)
     run = await api_client.post(f"/api/v1/branches/{main.id}/run", json={
         "expected_head_id": hidden.id, "expected_question_id": question.id,
@@ -341,18 +367,25 @@ async def test_run_keeps_pending_question_after_merge(api_client, api_gemini, mo
     assert hidden.content not in sent
 
 
-async def test_lifespan_initializes_sqlite_and_cors(monkeypatch):
+async def test_lifespan_requires_migrated_sqlite_and_rejects_cross_origin_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The app checks the revision and serves the existing API after Alembic runs."""
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from src import main
     from src.storage import database
+    from src.storage.migrations import upgrade_schema
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(main, "engine", engine)
     monkeypatch.setattr(database, "async_session_factory", async_sessionmaker(
         engine, expire_on_commit=False, autoflush=False,
     ))
+    with pytest.raises(RuntimeError, match="alembic upgrade head"):
+        async with main.app.router.lifespan_context(main.app):
+            pytest.fail("An unversioned database must prevent application startup.")
+
+    await upgrade_schema(engine)
     async with main.app.router.lifespan_context(main.app):
         async with AsyncClient(
             transport=ASGITransport(app=main.app), base_url="http://test",
@@ -362,8 +395,8 @@ async def test_lifespan_initializes_sqlite_and_cors(monkeypatch):
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "POST",
             })
-            assert response.status_code == 200
-            assert response.headers["access-control-allow-origin"] == "*"
+            assert response.status_code == 405
+            assert "access-control-allow-origin" not in response.headers
 
 
 async def test_run_maps_oversize_to_413(api_client, api_gemini, monkeypatch):
@@ -435,3 +468,42 @@ async def test_regenerate_failure_exposes_fork_for_retry(
     })
     assert retry.status_code == 200
     assert retry.json()["parent_id"] == first.id
+
+
+async def test_setting_context_mask_is_idempotent(api_client: AsyncClient) -> None:
+    """Повтор после потери ответа сохраняет маску, текст и связи реплики."""
+    _, main = await create_api_chat(api_client)
+    message = await append_api_message(api_client, main.id, "Keep the original text")
+    endpoint = f"/api/v1/messages/{message.id}/active"
+    for state in (False, False, True, True):
+        response = await api_client.put(endpoint, json={"is_active": state})
+        assert response.status_code == 200
+        assert response.json() == {"message_id": message.id, "is_active": state}
+        history = await api_client.get(
+            f"/api/v1/branches/{main.id}/timeline", params={"include_inactive": True},
+        )
+        saved = MessageResponse.model_validate(history.json()[0])
+        assert saved.is_active is state
+        assert saved.content == message.content
+        assert saved.parent_id == message.parent_id
+        assert saved.updated_at == message.updated_at
+
+
+@pytest.mark.parametrize("payload", [{}, {"is_active": None}, {"is_active": "false"}, {"is_active": 0}])
+async def test_context_mask_requires_an_explicit_boolean(api_client: AsyncClient, payload: dict[str, object]) -> None:
+    _, main = await create_api_chat(api_client)
+    message = await append_api_message(api_client, main.id, "Question")
+    response = await api_client.put(f"/api/v1/messages/{message.id}/active", json=payload)
+    assert response.status_code == 422
+    assert len((await api_client.get(f"/api/v1/branches/{main.id}/timeline")).json()) == 1
+
+
+async def test_setting_context_mask_of_missing_message_returns_404(api_client: AsyncClient) -> None:
+    response = await api_client.put(f"/api/v1/messages/{uuid4()}/active", json={"is_active": False})
+    assert response.status_code == 404
+
+
+async def test_cross_origin_responses_do_not_grant_browser_access(api_client: AsyncClient) -> None:
+    response = await api_client.get("/api/v1/chats", headers={"Origin": "https://untrusted.example"})
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
