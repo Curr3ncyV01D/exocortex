@@ -75,15 +75,18 @@ npm run dev
 
 ## Проверки
 
+- Единый локальный прогон — `.venv` Python с `scripts/check.py`; режимы `--e2e`, `--staged` и установка hook описаны в [инструкции локальных проверок](docs/how-to/checks.md).
 - Бэкенд из корня с активным окружением `.venv` — `python -m pytest`.
 - Фронтенд из `frontend/` — `npm test` и `npm run build`.
 - Сквозные проверки интерфейса, покрытия и локальный запуск — [руководство фронтенда](frontend/README.md).
+- Автоматические проверки push и pull request, окружения и отчёты — [CI в GitHub Actions](docs/how-to/ci.md).
 
 ## Документация
 
 | Раздел | Где читать |
 | --- | --- |
-| Как запустить или перенести данные | [Docker Compose](docs/how-to/run-with-docker.md), [миграции SQLite](docs/how-to/migrate-sqlite.md), [импорт из AI Studio](docs/how-to/import-ai-studio.md) |
+| Как запустить, проверить или перенести данные | [Docker Compose](docs/how-to/run-with-docker.md), [CI](docs/how-to/ci.md), [миграции SQLite](docs/how-to/migrate-sqlite.md), [импорт из AI Studio](docs/how-to/import-ai-studio.md) |
 | Как проверить живую генерацию | [Сценарий через Swagger](docs/how-to/test-gemini-with-swagger.md) |
 | Справочник | [Спецификация MVP](docs/SPEC.md), [REST API](docs/SPEC.md#5-контракты-api-и-pydantic-схемы-rest-interface), [схема SQLite](docs/db_architecture.md) |
 | Устройство приложения | [Транспорт и сервисы](docs/explanation/transport.md), [ядро агента](docs/agent_core.md), [операции графа](docs/spec_crud_graph.md) |
+| Планируемый интерфейс | [Согласованная спецификация проводника](docs/spec_chat_explorer.md), [roadmap](ROADMAP.md) |
