@@ -25,7 +25,7 @@ def test_alembic_installs_the_schema_and_fts_triggers(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stderr
 
     with closing(sqlite3.connect(database)) as conn:
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone() == ('0001',)
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone() == ('0002',)
         conn.execute("INSERT INTO chats VALUES ('chat', 'Chat', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
         conn.execute("INSERT INTO messages VALUES ('root', 'chat', NULL, 'USER', 'original', 0, 1, NULL, CURRENT_TIMESTAMP, NULL)")
         match = 'SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?'
@@ -39,7 +39,7 @@ def test_alembic_installs_the_schema_and_fts_triggers(tmp_path: Path) -> None:
 
 def test_adopt_legacy_database_preserves_data_and_backs_up_before_stamp(tmp_path: Path) -> None:
     database = tmp_path / 'legacy.db'
-    created = run_database_command(database, 'alembic', 'upgrade', 'head')
+    created = run_database_command(database, 'alembic', 'upgrade', '0001')
     assert created.returncode == 0, created.stderr
     with closing(sqlite3.connect(database)) as conn:
         conn.execute('DROP TABLE alembic_version')
@@ -63,7 +63,7 @@ def test_adopt_legacy_database_preserves_data_and_backs_up_before_stamp(tmp_path
 
 def test_adoption_refuses_an_incompatible_schema(tmp_path: Path) -> None:
     database = tmp_path / 'outdated.db'
-    created = run_database_command(database, 'alembic', 'upgrade', 'head')
+    created = run_database_command(database, 'alembic', 'upgrade', '0001')
     assert created.returncode == 0, created.stderr
     with closing(sqlite3.connect(database)) as conn:
         conn.execute('DROP TABLE alembic_version')

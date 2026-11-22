@@ -54,7 +54,8 @@ erDiagram
         string message_id PK, FK "Внешний ключ на messages.id (полиморфизм)"
         string source_branch_name "Имя поглощенной ветки"
         string chat_id FK "Чат узла и границы слияния"
-        string forked_from_msg_id FK "Внешний ключ на messages.id (узел форка)"
+        string forked_from_msg_id FK "Начальная граница слияния"
+        string source_head_message_id FK "Фактический HEAD источника; nullable для старых событий"
         integer compressed_messages_count "Количество сжатых реплик дельты"
     }
 ```
@@ -115,8 +116,9 @@ erDiagram
 | :--- | :--- | :--- | :--- |
 | `message_id` | `VARCHAR(36)` | `PK, FK (messages.id) ON DELETE CASCADE` | Идентификатор базового узла сообщения с ролью `system_merge`. |
 | `source_branch_name` | `VARCHAR(64)` | `NOT NULL` | Имя побочной ветки, подвергнутой сжатию. |
-| `forked_from_msg_id` | `VARCHAR(36)` | `FK (messages.id), NOT NULL` | Точка исходного ветвления сжимаемой ветки. |
+| `forked_from_msg_id` | `VARCHAR(36)` | `FK (messages.id), NOT NULL` | Начальная граница текущего слияния; при повторном — прежний last_merged_message_id. |
 | `compressed_messages_count` | `INTEGER` | `NOT NULL` | Общее количество реплик, вошедших в дельту сжатия. |
+| `source_head_message_id` | `VARCHAR(36)` | `FK (chat_id, source_head_message_id) → messages(chat_id, id), NULLABLE` | Фактическая вершина источника на момент слияния, включая скрытый HEAD. Старые события сохраняют `NULL`. |
 
 ### Составные внешние ключи графа
 
@@ -170,3 +172,7 @@ PRAGMA cache_size = -64000;
 2. **Инвариант мутации контента:** Поле `updated_at` принимает значение `utcnow()` **только** при модификации поля `content`. Переключение флага `is_active` не считается изменением содержимого и не изменяет `updated_at`.
 3. **Инвариант безопасного маскирования:** Сообщения физически не удаляются из таблицы `messages` для исключения разрыва цепочек `parent_id`. Любая операция удаления на уровне API транслируется в установку флага `is_active = FALSE`.
 4. **Инвариант изоляции пространства:** Значение `parent_id` дочернего сообщения обязано ссылаться на сообщение с идентичным `chat_id`. Ссылки между разными чатами запрещены.
+
+### Происхождение слияний: ревизия `0002`
+
+Составной внешний ключ `(chat_id, source_head_message_id)` таблицы `merge_events` ссылается на `messages(chat_id, id)`. Для старых событий значение остаётся `NULL`, без автоматического восстановления. Для новых сохраняется фактический HEAD источника, включая скрытый, в транзакции слияния. Это связь происхождения сводки, не дополнительный `parent_id`.

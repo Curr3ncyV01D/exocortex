@@ -105,7 +105,8 @@ erDiagram
         string message_id PK, FK "Ссылка на messages.id"
         string chat_id FK "Чат обеих ссылок слияния"
         string source_branch_name "Имя поглощенной ветки"
-        string forked_from_msg_id FK "Узел исходного ветвления"
+        string forked_from_msg_id FK "Начальная граница слияния"
+        string source_head_message_id FK "Фактический HEAD источника; nullable для старых событий"
         integer compressed_messages_count "Объем сжатого пула реплик"
     }
 ```
@@ -171,8 +172,9 @@ erDiagram
 | `message_id`                | `VARCHAR(36)` | `PRIMARY KEY, FOREIGN KEY (messages.id) ON DELETE CASCADE` | Идентификатор базового узла сообщения.                          |
 | `chat_id` | `VARCHAR(36)` | `NOT NULL`, часть обоих составных FK на `messages` | Чат узла слияния и границы дельты. |
 | `source_branch_name`        | `VARCHAR(64)` | `NOT NULL`                                                 | Имя поглощенной побочной ветки.                                 |
-| `forked_from_msg_id`        | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NOT NULL`                      | Узел, на котором побочная ветка когда-то разделилась с целевой. |
+| `forked_from_msg_id`        | `VARCHAR(36)` | `FOREIGN KEY (messages.id), NOT NULL`                      | Начальная граница текущего слияния; при повторном слиянии используется прежний last_merged_message_id. |
 | `compressed_messages_count` | `INTEGER`     | `NOT NULL`                                                 | Число реплик побочной ветки, подвергнутых компрессии.           |
+| `source_head_message_id` | `VARCHAR(36)` | `FK (chat_id, source_head_message_id) → messages(chat_id, id), NULLABLE` | Фактическая вершина источника на момент слияния, включая скрытый HEAD. Старые события сохраняют `NULL`. |
 
 ***
 
@@ -339,7 +341,7 @@ flowchart TD
    * Пустая или пробельная выжимка отклоняется с `InvalidMergeError` до записи. Та же дельта остаётся доступной при повторной попытке.
    * После суммаризации атомарно проверяются вершины и точки последнего слияния обеих веток. При несовпадении выбрасывается `BranchConflictError`.
    * Создается `Message(role=SYSTEM_MERGE, parent_id=target.head_message_id, content=summary, chat_id=chat_id)`.
-   * Создается `MergeEvent(message_id=new_msg.id, source_branch_name=source.name, forked_from_msg_id=start_node, compressed_messages_count=len(active_delta))`.
+   * Создается `MergeEvent(message_id=new_msg.id, source_branch_name=source.name, forked_from_msg_id=start_node, source_head_message_id=source_head_id, compressed_messages_count=len(active_delta))`.
    * Сдвигается указатель целевой ветки: `target.head_message_id = new_msg.id`.
    * **Фиксация точки слияния:** `source.last_merged_message_id = source.head_message_id`.
    * Статус исходной ветки сохраняется. Снятие маски со старой реплики возвращает её в контекст ветки. Граница уже обработанной дельты сохраняется.
@@ -704,3 +706,24 @@ class AncestorMutationWarningResponse(BaseModel):
 Ключ `Idempotency-Key` действует в пределах ветки. Повтор с тем же ключом и исходным текстом возвращает существующую реплику с тем же ID и статусом `201`, даже если она была отредактирована или вершина ветки продвинулась. Повтор ключа с другим текстом возвращает `409`. Запись ключа и реплики фиксируется в одной транзакции. Запросы без ключа добавляют новую реплику.
 
 REST API предназначен для обращения с того же origin, что и интерфейс: Vite и Nginx проксируют `/api/`. Приложение не выдаёт разрешений CORS для сторонних origin. Это браузерное ограничение не заменяет аутентификацию и не защищает от прямых небраузерных запросов; локальный запуск сохраняет привязку опубликованного порта к `127.0.0.1`.
+
+#### 5.2.4. Компактный граф чата
+
+`GET /api/v1/chats/{chat_id}/graph` возвращает `ChatGraphResponse` из одного снимка чтения SQLite. Gemini не вызывается. Ответ содержит:
+
+| Поле | Контракт |
+| --- | --- |
+| `chat_id` | ID запрошенного чата |
+| `nodes` | Все сообщения чата: `id`, nullable `parent_id`, `role`, `preview`, `is_active`, `is_edited`, `created_at`, nullable `updated_at` |
+| `branches` | Все ветки, включая `merged` и `archived`, в существующем формате `BranchResponse` |
+| `merges` | `message_id`, `source_branch_name`, nullable `source_head_message_id`, `compressed_messages_count` |
+
+Превью — первые 200 символов текста после объединения пробельных последовательностей в один пробел. Это обычный текст, не HTML. Полные тексты, metadata и трассировки в ответ не включаются. Время сериализуется в UTC, как в остальных DTO.
+
+Скрытые сообщения и узлы, не достижимые от текущих указателей веток, остаются в `nodes`; общие сообщения не дублируются. Фильтрации по выбранной ветке и пагинации графа нет. Порядок массивов детерминирован: узлы и ветки по `(created_at, id)`, события по `message_id`; порядок массивов не определяет историю. История восстанавливается по `parent_id`, а пунктир происхождения — по `source_head_message_id → message_id`. Координаты, оформление и отдельный массив рёбер не передаются.
+
+Пустой существующий чат возвращает `200` с пустыми `nodes`/`merges` и веткой `main`. Неизвестный чат — `404` с `ErrorResponse`. Нарушенные ссылки, циклы родительской цепочки или несоответствие узлов `system_merge` таблице событий дают `500` с `{"detail": "Нарушена целостность графа."}`. Неизвестный старый источник — допустимый `null`, а не ошибка.
+
+Миграция `0002` добавляет источник с составным внешним ключом `(chat_id, source_head_message_id) → messages(chat_id, id)`. Старые записи не восстанавливаются автоматически. Новое слияние сохраняет фактический HEAD атомарно со сводкой и указателями, даже когда сам HEAD скрыт. Правила контекста LLM и инкрементальных слияний не меняются.
+
+API реализован; визуальный проводник и навигация по нему относятся к следующим вехам [трекера](specs/001-explorer.md).

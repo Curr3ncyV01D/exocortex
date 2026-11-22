@@ -29,6 +29,31 @@ export interface MessageResponse {
   updated_at: string | null
 }
 
+export interface GraphNodeResponse {
+  id: string
+  parent_id: string | null
+  role: MessageResponse['role']
+  preview: string
+  is_active: boolean
+  is_edited: boolean
+  created_at: string
+  updated_at: string | null
+}
+
+export interface GraphMergeResponse {
+  message_id: string
+  source_branch_name: string
+  source_head_message_id: string | null
+  compressed_messages_count: number
+}
+
+export interface ChatGraphResponse {
+  chat_id: string
+  nodes: GraphNodeResponse[]
+  branches: BranchResponse[]
+  merges: GraphMergeResponse[]
+}
+
 export interface MessageActiveResponse {
   message_id: string
   is_active: boolean

@@ -12,6 +12,8 @@ from src.agent.diagnostics import describe_failure, logger, operation_id, operat
 from src.config import settings
 from src.agent.loop import LLMGenerationError, run_turn
 from src.storage.crud.chats import append_message
+from src.storage.crud.explorer import read_chat_graph
+from src.schemas import BranchResponse, ChatGraphResponse, GraphMergeResponse, GraphNodeResponse
 from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
@@ -73,6 +75,25 @@ async def create_chat(session: AsyncSession, title: str) -> Chat:
 
 async def list_chats(session: AsyncSession) -> list[Chat]:
     return list(await session.scalars(select(Chat).order_by(Chat.updated_at.desc(), Chat.id)))
+
+
+async def get_chat_graph(session: AsyncSession, chat_id: str) -> ChatGraphResponse:
+    """Build a compact graph from one read snapshot without reserving SQLite's writer slot."""
+    async with session.begin():
+        # sqlite3 legacy transaction control does not start a transaction for SELECT.
+        await session.execute(text("BEGIN"))
+        snapshot = await read_chat_graph(session, chat_id)
+        if snapshot is None:
+            raise ChatNotFoundError(f"Чат {chat_id} не найден.")
+        nodes = [GraphNodeResponse(
+            **{key: value for key, value in node.items() if key != "content"},
+            preview=" ".join(node["content"].split())[:200],
+        ) for node in snapshot.messages]
+        return ChatGraphResponse(
+            chat_id=chat_id, nodes=nodes,
+            branches=[BranchResponse.model_validate(branch) for branch in snapshot.branches],
+            merges=[GraphMergeResponse.model_validate(merge) for merge in snapshot.merges],
+        )
 
 
 async def list_branches(session: AsyncSession, chat_id: str) -> list[Branch]:

@@ -225,6 +225,10 @@ class MergeEvent(Message):
         ForeignKeyConstraint(
             ["chat_id", "forked_from_msg_id"], ["messages.chat_id", "messages.id"],
         ),
+        ForeignKeyConstraint(
+            ["chat_id", "source_head_message_id"], ["messages.chat_id", "messages.id"],
+            name="fk_merge_source_head",
+        ),
     )
 
     message_id: Mapped[str] = mapped_column(
@@ -241,6 +245,7 @@ class MergeEvent(Message):
         Integer,
         nullable=False,
     )
+    source_head_message_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     __mapper_args__ = {
         "polymorphic_identity": MessageRole.SYSTEM_MERGE,

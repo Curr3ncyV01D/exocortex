@@ -69,6 +69,31 @@ class BranchMergeRequest(BaseModel):
     target_branch: Literal["main"] = "main"
 
 
+class GraphNodeResponse(BaseModel):
+    id: str
+    parent_id: str | None
+    role: RoleEnum
+    preview: str = Field(max_length=200)
+    is_active: bool
+    is_edited: bool
+    created_at: UtcDatetime
+    updated_at: UtcDatetime | None
+
+
+class GraphMergeResponse(BaseModel):
+    message_id: str
+    source_branch_name: str
+    source_head_message_id: str | None
+    compressed_messages_count: int
+
+
+class ChatGraphResponse(BaseModel):
+    chat_id: str
+    nodes: list[GraphNodeResponse]
+    branches: list[BranchResponse]
+    merges: list[GraphMergeResponse]
+
+
 class BranchMergeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
