@@ -8,6 +8,9 @@ export default defineConfig({
     include: ['tests/**/*.test.{ts,tsx}'],
     environment: 'jsdom',
     setupFiles: ['./tests/setup.ts'],
+    // Full-app DOM interactions need headroom when local development also runs Docker.
+    maxWorkers: 2,
+    testTimeout: 10_000,
     coverage: {
       include: ['src/**/*.{ts,tsx}'],
       reporter: ['text-summary', 'html'],
