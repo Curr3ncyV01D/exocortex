@@ -1,6 +1,5 @@
 # --- Local Data Files ---
-.context/
-.data/
+.context_of_project/
 
 # --- Python Virtual Environment ---
 .venv/
