@@ -20,7 +20,8 @@ it('starts with the explorer closed and remembers when it is opened', async () =
   expect(screen.queryByRole('region', { name: 'Панель проводника' })).not.toBeInTheDocument()
 
   await user.click(toggle)
-  expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  expect(screen.getByRole('button', { name: 'Проводник' })).toHaveAttribute('aria-expanded', 'true')
+  expect(toggle).not.toBeInTheDocument()
   expect(screen.getByRole('region', { name: 'Панель проводника' })).toBeVisible()
   app.unmount()
 

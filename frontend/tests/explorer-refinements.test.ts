@@ -1,5 +1,13 @@
 import { expect, it } from 'vitest'
+import { getLayoutPreferences, saveLayoutPreferences } from '../src/features/layout/preferences'
 import { routeConnection, placeLabels } from '../src/features/explorer/routing'
+
+/** Legacy preferences retain their meaning while expanded layouts can exceed half the column. */
+it('restores expanded explorer sizes and collapsed chat state without losing the restore height', () => {
+  const preferences = { sidebarWidth: 25, explorerHeight: 82, explorerOpen: true, chatsCollapsed: true }
+  saveLayoutPreferences(preferences)
+  expect(getLayoutPreferences()).toEqual(preferences)
+})
 
 it('routes long merge connections away from both history lanes', () => {
   const points = routeConnection({ x: 90, y: 20 }, { x: 0, y: 800 }, 'merge')

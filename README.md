@@ -89,4 +89,4 @@ npm run dev
 | Как проверить живую генерацию | [Сценарий через Swagger](docs/how-to/test-gemini-with-swagger.md) |
 | Справочник | [Спецификация MVP](docs/SPEC.md), [REST API](docs/SPEC.md#5-контракты-api-и-pydantic-схемы-rest-interface), [схема SQLite](docs/db_architecture.md) |
 | Устройство приложения | [Транспорт и сервисы](docs/explanation/transport.md), [ядро агента](docs/agent_core.md), [операции графа](docs/spec_crud_graph.md) |
-| Планируемый интерфейс | [Согласованная спецификация проводника](docs/spec_chat_explorer.md), [roadmap](ROADMAP.md) |
+| Проводник | [Работа с миникартой](docs/how-to/use-explorer.md), [спецификация](docs/spec_chat_explorer.md), [roadmap](ROADMAP.md) |

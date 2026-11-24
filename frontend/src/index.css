@@ -1,7 +1,7 @@
 @import "tailwindcss";
 /* React Flow geometry is styled independently of the surrounding workspace. */
 
-.explorer-panel { position: relative; display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.explorer-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
 /* Preserve a measurable viewport during the final drag frame; the island clips it. */
 .explorer-canvas { position: relative; flex: 1; min-height: 1px; }
 .explorer-canvas .react-flow { background: transparent; }
@@ -251,4 +251,10 @@
   }
 }
 
+.sidebar-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; gap: 12px; }
+.sidebar-navigation { flex-shrink: 0; padding: 12px; }
+.sidebar-shell > [data-group] { flex: 1; min-height: 0; }
+.island-toggle { display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 6px; background: transparent; color: #adb4bf; font-size: 13px; cursor: pointer; }
+.island-toggle:hover, .island-toggle:focus-visible { color: #f1f3f6; background: #ffffff0a; }
+.explorer-panel { position: relative; }
 .explorer-branch-label { width: 110px; max-width: 110px; line-height: 16px; border-radius: 3px; background: #161718e8; padding: 0 2px; }

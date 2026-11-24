@@ -1,12 +1,14 @@
-import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { Group, Panel, Separator } from 'react-resizable-panels'
+import { lazy, Suspense, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react'
+import { Group, Panel, Separator, type GroupImperativeHandle } from 'react-resizable-panels'
 import { ChatSidebar } from '../chats/ChatSidebar'
+import { NewChatButton } from '../chats/NewChatButton'
 import { Conversation } from '../conversation/Conversation'
 import { getLayoutPreferences, saveLayoutPreferences } from './preferences'
-
-const ExplorerPanel = lazy(() => import('../explorer/ExplorerPanel').then((module) => ({ default: module.ExplorerPanel })))
+import { createResizeQueue } from './resizeQueue'
+import { layoutReducer, sidebarLayout, sidebarVisibility, type LayoutAction } from './sidebarState'
 
 const desktopQuery = '(min-width: 48rem)'
+const ExplorerPanel = lazy(() => import('../explorer/ExplorerPanel').then((module) => ({ default: module.ExplorerPanel })))
 
 function subscribeToViewport(onChange: () => void) {
   const media = window.matchMedia?.(desktopQuery)
@@ -66,8 +68,28 @@ function MobileWorkspace() {
 
 export function WorkspaceLayout() {
   const desktop = useSyncExternalStore(subscribeToViewport, isDesktop)
-  const [preferences, setPreferences] = useState(getLayoutPreferences)
-  const { sidebarWidth, explorerHeight, explorerOpen } = preferences
+  const [preferences, dispatch] = useReducer(layoutReducer, undefined, getLayoutPreferences)
+  const { sidebarWidth, explorerOpen, chatsCollapsed = false } = preferences
+  const sidebar = useRef<GroupImperativeHandle>(null)
+  const resizeQueue = useMemo(() => createResizeQueue<LayoutAction>(dispatch), [])
+  useEffect(() => () => resizeQueue.dispose(), [resizeQueue])
+  // Re-project visibility commands only; ordinary user resizing owns the live geometry.
+  const initialSidebarLayout = useMemo(() => sidebarLayout(preferences), [chatsCollapsed, explorerOpen])
+  useEffect(() => {
+    if (desktop && (!chatsCollapsed || explorerOpen)) sidebar.current?.setLayout(initialSidebarLayout)
+  }, [desktop, initialSidebarLayout, chatsCollapsed, explorerOpen])
+  const columnLayout = useMemo(() => ({ sidebar: sidebarWidth, conversation: 100 - sidebarWidth }), [sidebarWidth])
+  function togglePanel(panel: 'chats' | 'explorer') {
+    resizeQueue.dispose()
+    dispatch({ type: 'toggle', panel })
+  }
+  function toggleChats() { togglePanel('chats') }
+  function toggleExplorer() { togglePanel('explorer') }
+  function sectionToggle(name: string, open: boolean, action: () => void, controls: string) {
+    return <button type="button" className="island-toggle" aria-expanded={open} aria-controls={controls} onClick={action}>
+      <span aria-hidden="true">{open ? '⌄' : '›'}</span> {name}
+    </button>
+  }
 
   useEffect(() => {
     saveLayoutPreferences(preferences)
@@ -78,53 +100,53 @@ export function WorkspaceLayout() {
       {desktop ? (
         <Group
           id="workspace-columns"
-          defaultLayout={{ sidebar: sidebarWidth, conversation: 100 - sidebarWidth }}
+          defaultLayout={columnLayout}
           onLayoutChanged={(layout, { isUserInteraction }) => {
             if (isUserInteraction) {
-              setPreferences((current) => ({ ...current, sidebarWidth: layout.sidebar }))
+              dispatch({ type: 'width', value: layout.sidebar })
             }
           }}
         >
           <Panel id="sidebar" minSize="12rem" maxSize="42%">
-            <Group
-              id="workspace-sidebar"
-              orientation="vertical"
-              defaultLayout={explorerOpen ? { chats: 100 - explorerHeight, explorer: explorerHeight } : { chats: 100 }}
-              onLayoutChanged={(layout, { isUserInteraction }) => {
-                if (isUserInteraction && layout.explorer !== undefined) {
-                  setPreferences((current) => ({ ...current, explorerHeight: layout.explorer }))
-                }
-              }}
-            >
-              <Panel id="chats"><ChatSidebar /></Panel>
-              {explorerOpen && (
+            <div className="sidebar-shell">
+              <header className="workspace-island sidebar-navigation">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="font-semibold">ExoCortex</p><NewChatButton />
+                </div>
+                <div className="mt-2 flex min-h-7 flex-wrap gap-2">
+                  {chatsCollapsed && sectionToggle('Чаты', false, toggleChats, 'chat-list')}
+                  {!explorerOpen && sectionToggle('Проводник', false, toggleExplorer, 'explorer-region')}
+                </div>
+              </header>
+              {(!chatsCollapsed || explorerOpen) && <Group id="workspace-sidebar" orientation="vertical"
+                groupRef={sidebar} defaultLayout={initialSidebarLayout}
+                onLayoutChanged={(layout, { isUserInteraction }) => {
+                  if (isUserInteraction) resizeQueue.push({
+                    type: 'resize', layout: { chats: layout.chats, explorer: layout.explorer },
+                    source: sidebarVisibility(preferences),
+                  })
+                }}>
+                <Panel id="chats" collapsible collapsedSize="0%" minSize="8rem">
+                  {!chatsCollapsed && <div className="workspace-island h-full overflow-hidden flex flex-col">
+                    <header className="px-3 py-2">{sectionToggle('Чаты', true, toggleChats, 'chat-list')}</header>
+                    <div id="chat-list" className="min-h-0 flex-1"><ChatSidebar listOnly /></div>
+                  </div>}
+                </Panel>
                 <Separator aria-label="Высота проводника" className="workspace-separator h-3" />
-              )}
-              {explorerOpen && (
-                <Panel id="explorer" minSize="18%" maxSize="50%">
-                  <section id="explorer-region" aria-label="Панель проводника" className="workspace-island explorer-panel">
-                    <h2 className="px-3 py-2 text-sm font-medium text-muted">Проводник</h2>
+                <Panel id="explorer" collapsible collapsedSize="0%" minSize="18%">
+                  {explorerOpen && <section id="explorer-region" aria-label="Панель проводника" className="workspace-island explorer-panel">
+                    <header className="px-3 py-2">{sectionToggle('Проводник', true, toggleExplorer, 'explorer-region')}</header>
                     <Suspense fallback={<p role="status" className="p-3 text-sm text-muted">Загрузка проводника…</p>}>
                       <ExplorerPanel />
                     </Suspense>
-                  </section>
+                  </section>}
                 </Panel>
-              )}
-            </Group>
+              </Group>}
+            </div>
           </Panel>
           <Separator aria-label="Ширина левой колонки" className="workspace-separator w-3" />
           <Panel id="conversation" minSize="27rem">
-            <Conversation navigation={
-              <button
-                type="button"
-                className="button-secondary"
-                aria-expanded={explorerOpen}
-                aria-controls={explorerOpen ? 'explorer-region' : undefined}
-                onClick={() => setPreferences((current) => ({ ...current, explorerOpen: !current.explorerOpen }))}
-              >
-                Проводник
-              </button>
-            } />
+            <Conversation navigation={null} />
           </Panel>
         </Group>
       ) : <MobileWorkspace />}
