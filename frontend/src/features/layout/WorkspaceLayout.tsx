@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Group, Panel, Separator } from 'react-resizable-panels'
 import { ChatSidebar } from '../chats/ChatSidebar'
 import { Conversation } from '../conversation/Conversation'
 import { getLayoutPreferences, saveLayoutPreferences } from './preferences'
+
+const ExplorerPanel = lazy(() => import('../explorer/ExplorerPanel').then((module) => ({ default: module.ExplorerPanel })))
 
 const desktopQuery = '(min-width: 48rem)'
 
@@ -100,8 +102,11 @@ export function WorkspaceLayout() {
               )}
               {explorerOpen && (
                 <Panel id="explorer" minSize="18%" maxSize="50%">
-                  <section id="explorer-region" aria-label="Панель проводника" className="workspace-island h-full overflow-auto px-4 py-3">
-                    <h2 className="text-sm font-medium text-muted">Проводник</h2>
+                  <section id="explorer-region" aria-label="Панель проводника" className="workspace-island explorer-panel">
+                    <h2 className="px-3 py-2 text-sm font-medium text-muted">Проводник</h2>
+                    <Suspense fallback={<p role="status" className="p-3 text-sm text-muted">Загрузка проводника…</p>}>
+                      <ExplorerPanel />
+                    </Suspense>
                   </section>
                 </Panel>
               )}

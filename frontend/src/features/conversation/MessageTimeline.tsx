@@ -6,16 +6,10 @@ import type { MessageResponse } from '../../api/types'
 import { asRecord, formatDuration, readExecutionTrace } from './executionTrace'
 import { MessageActions } from './MessageActions'
 import { MessageEditor } from './MessageEditor'
+import { editedTitle } from './messageTime'
 
 const clock = new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' })
-const calendarDate = new Intl.DateTimeFormat('ru', { dateStyle: 'medium' })
 const timestamp = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' })
-
-function editedTitle(updatedAt: string | null): string {
-  if (!updatedAt) return 'Реплика отредактирована'
-  const edited = new Date(updatedAt)
-  return `Реплика отредактирована в ${clock.format(edited)} (${calendarDate.format(edited)})`
-}
 
 function TechnicalDetails({ label, children }: { label: string; children: ReactNode }) {
   return (

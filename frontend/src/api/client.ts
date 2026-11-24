@@ -1,6 +1,6 @@
 import type {
   AncestorMutationWarningResponse, BranchMergeResponse, BranchResponse, ChatResponse,
-  MessageResponse, RegenerateReplyResponse, RunTarget, MessageActiveResponse,
+  MessageResponse, RegenerateReplyResponse, RunTarget, MessageActiveResponse, ChatGraphResponse,
 } from './types'
 
 const apiPrefix = '/api/v1'
@@ -64,6 +64,9 @@ function jsonRequest<T>(path: string, method: 'POST' | 'PATCH' | 'PUT', body: ob
 }
 
 export const api = {
+  getGraph: (chatId: string, signal?: AbortSignal) =>
+    request<ChatGraphResponse>(`/chats/${encodeURIComponent(chatId)}/graph`, { signal }),
+
   listChats: (signal?: AbortSignal) => request<ChatResponse[]>('/chats', { signal }),
 
   createChat: (title: string, signal?: AbortSignal) => post<ChatResponse>('/chats', { title }, signal),
