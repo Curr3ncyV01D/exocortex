@@ -85,10 +85,13 @@ async def get_chat_graph(session: AsyncSession, chat_id: str) -> ChatGraphRespon
         snapshot = await read_chat_graph(session, chat_id)
         if snapshot is None:
             raise ChatNotFoundError(f"Чат {chat_id} не найден.")
-        nodes = [GraphNodeResponse(
-            **{key: value for key, value in node.items() if key != "content"},
-            preview=" ".join(node["content"].split())[:200],
-        ) for node in snapshot.messages]
+        nodes: list[GraphNodeResponse] = []
+        for node in snapshot.messages:
+            normalized = " ".join(node["content"].split())
+            nodes.append(GraphNodeResponse(
+                **{key: value for key, value in node.items() if key != "content"},
+                preview=normalized[:200], preview_truncated=len(normalized) > 200,
+            ))
         return ChatGraphResponse(
             chat_id=chat_id, nodes=nodes,
             branches=[BranchResponse.model_validate(branch) for branch in snapshot.branches],

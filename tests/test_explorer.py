@@ -70,7 +70,7 @@ async def test_graph_is_compact_complete_unique_and_chat_scoped(
     assert foreign.id not in nodes
     assert nodes[last.id] == {
         "id": last.id, "parent_id": first.id, "role": "user",
-        "preview": ("**Текст** " + "я" * 230)[:200], "is_active": False,
+        "preview": ("**Текст** " + "я" * 230)[:200], "preview_truncated": True, "is_active": False,
         "is_edited": True, "created_at": "2020-01-02T03:04:00Z", "updated_at": "2020-01-02T03:04:00Z",
     }
     assert "DO_NOT_EXPOSE" not in response.text and body not in response.text

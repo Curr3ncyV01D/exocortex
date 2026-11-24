@@ -74,6 +74,7 @@ class GraphNodeResponse(BaseModel):
     parent_id: str | None
     role: RoleEnum
     preview: str = Field(max_length=200)
+    preview_truncated: bool
     is_active: bool
     is_edited: bool
     created_at: UtcDatetime

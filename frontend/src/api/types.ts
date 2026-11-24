@@ -34,6 +34,7 @@ export interface GraphNodeResponse {
   parent_id: string | null
   role: MessageResponse['role']
   preview: string
+  preview_truncated: boolean
   is_active: boolean
   is_edited: boolean
   created_at: string
