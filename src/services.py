@@ -13,7 +13,11 @@ from src.config import settings
 from src.agent.loop import LLMGenerationError, run_turn
 from src.storage.crud.chats import append_message
 from src.storage.crud.explorer import read_chat_graph
-from src.schemas import BranchResponse, ChatGraphResponse, GraphMergeResponse, GraphNodeResponse
+from src.storage.crud.timeline import read_timeline_window
+from src.schemas import (
+    BranchResponse, ChatGraphResponse, GraphMergeResponse, GraphNodeResponse, MessageResponse,
+    TimelineWindowQuery, TimelineWindowResponse, DialogueReferenceResponse, RunTargetResponse,
+)
 from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
@@ -121,6 +125,31 @@ async def get_timeline(
     return await read_context_from_head(
         branch.chat_id, branch.head_message_id, session, include_inactive=include_inactive,
     )
+
+
+async def get_timeline_window(
+    session: AsyncSession, branch_id: str, *, mode: str = "tail", anchor_id: str | None = None,
+    radius: int | None = None, limit: int | None = None,
+) -> TimelineWindowResponse:
+    """Return the display window and real branch state from one SQLite read snapshot."""
+    query = TimelineWindowQuery(mode=mode, anchor_id=anchor_id, radius=radius, limit=limit)
+    async with session.begin():
+        await session.execute(text("BEGIN"))
+        window = await read_timeline_window(
+            session, branch_id, mode=query.mode, anchor_id=query.anchor_id,
+            radius=20 if query.radius is None else query.radius, limit=40 if query.limit is None else query.limit,
+        )
+        last = window.last_active_dialogue
+        target = RunTargetResponse(expected_head_id=window.branch.head_message_id, expected_question_id=last[0]) \
+            if last is not None and last[1] == MessageRole.USER else None
+        return TimelineWindowResponse(
+            branch=BranchResponse.model_validate(window.branch),
+            messages=[MessageResponse.model_validate(message) for message in window.messages],
+            has_older=window.has_older, has_newer=window.has_newer,
+            older_cursor=window.older_cursor, newer_cursor=window.newer_cursor,
+            last_active_dialogue=DialogueReferenceResponse(id=last[0], role=last[1].value) if last else None,
+            run_target=target,
+        )
 
 
 async def send_message(

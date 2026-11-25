@@ -84,3 +84,22 @@ export interface AncestorMutationWarningResponse {
   affected_branch_count: number
   message: string
 }
+
+
+export interface TimelineWindowQuery {
+  mode?: 'tail' | 'around' | 'older' | 'newer'
+  anchor_id?: string
+  radius?: number
+  limit?: number
+}
+
+export interface TimelineWindowResponse {
+  branch: BranchResponse
+  messages: MessageResponse[]
+  has_older: boolean
+  has_newer: boolean
+  older_cursor: string | null
+  newer_cursor: string | null
+  last_active_dialogue: { id: string; role: 'user' | 'model' } | null
+  run_target: { expected_head_id: string; expected_question_id: string } | null
+}
