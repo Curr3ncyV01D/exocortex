@@ -1,3 +1,4 @@
+import { windowFixture } from '../tests/window-fixture.js'
 import { expect, test } from '@playwright/test'
 import type { MessageResponse } from '../src/api/types.js'
 import { chat, main, timeline } from '../tests/fixtures.js'
@@ -12,7 +13,7 @@ test('renders a long timeline in batches and anchors scroll when revealing older
   }))
   await page.route('**/api/v1/chats', (route) => route.fulfill({ json: [chat] }))
   await page.route('**/api/v1/chats/*/branches', (route) => route.fulfill({ json: [main] }))
-  await page.route('**/api/v1/branches/*/timeline?*', (route) => route.fulfill({ json: history }))
+  await page.route('**/api/v1/branches/*/timeline/window**', (route) => route.fulfill({ json: windowFixture(main, history, new URL(route.request().url()).searchParams) }))
   await page.goto('/')
 
   const list = page.getByRole('list', { name: 'История сообщений' })

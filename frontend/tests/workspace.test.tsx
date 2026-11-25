@@ -1,21 +1,32 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 import App from '../src/App'
 import type { MessageResponse } from '../src/api/types'
 import { chat, main, side, timeline } from './fixtures'
+import { windowFixture } from './window-fixture'
 
 const chatsUrl = '/api/v1/chats'
 const branchesUrl = `${chatsUrl}/${chat.id}/branches`
 const timelineUrl = (branchId: string) =>
-  `/api/v1/branches/${branchId}/timeline?include_inactive=true`
+  `/api/v1/branches/${branchId}/timeline/window`
 
 /** Run the app against the fetch boundary and fail on unexpected routes. */
 function mockReadApi(routes: Record<string, () => Response | Promise<Response>>) {
+  const knownBranches = new Map<string, typeof main>()
   const fetchMock = vi.fn(async (url: string) => {
-    const handler = routes[url]
+    const parsed = new URL(url, 'http://test')
+    const handler = routes[url] ?? routes[parsed.pathname]
     if (!handler) throw new Error(`Unexpected request: ${url}`)
-    return handler()
+    const response = await handler()
+    if (response.ok && parsed.pathname.endsWith('/branches')) {
+      for (const branch of await response.clone().json()) knownBranches.set(branch.id, branch)
+    }
+    if (response.ok && parsed.pathname.endsWith('/timeline/window')) {
+      const id = parsed.pathname.split('/')[4]
+      return Response.json(windowFixture(knownBranches.get(id) ?? { ...main, id }, await response.json(), parsed.searchParams))
+    }
+    return response
   })
   vi.stubGlobal('fetch', fetchMock)
   return fetchMock
@@ -80,7 +91,7 @@ async function renderLongTimeline() {
 }
 
 /** Reveal only on upward threshold crossings and preserve the reading position. */
-it('reveals older pages on upward scroll without requesting the history again', async () => {
+it('loads cursor pages on upward scroll while preserving the reading position', async () => {
   const { mock, list, scrollArea, scrollTo } = await renderLongTimeline()
   const cards = () => list.children
   expect(cards()).toHaveLength(40)
@@ -94,24 +105,25 @@ it('reveals older pages on upward scroll without requesting the history again', 
   scrollTo(251)
   expect(cards()).toHaveLength(40)
   scrollTo(250)
-  expect(cards()).toHaveLength(80)
+  await waitFor(() => expect(cards()).toHaveLength(80))
   expect(cards()[0]).toHaveTextContent('Реплика 6')
   expect(scrollArea.scrollTop).toBe(250 + 40 * 70)
   fireEvent.scroll(scrollArea)
-  expect(cards()).toHaveLength(80)
+  await waitFor(() => expect(cards()).toHaveLength(80))
   scrollTo(120)
-  expect(cards()).toHaveLength(85)
+  await waitFor(() => expect(cards()).toHaveLength(85))
   expect(within(scrollArea).queryByRole('button', { name: /Показать предыдущие/ })).not.toBeInTheDocument()
-  expect(mock).toHaveBeenCalledTimes(requestsBeforeReveal)
+  expect(mock).toHaveBeenCalledTimes(requestsBeforeReveal + 2)
+  expect(mock.mock.calls.filter(([url]) => url.includes('mode=older'))).toHaveLength(2)
 })
 
 /** A generated answer must not discard messages already revealed in this branch. */
-it('keeps the expanded history after appending a generated answer', async () => {
+it('keeps the loaded window after appending a generated answer', async () => {
   const { list, scrollTo } = await renderLongTimeline()
   scrollTo(800)
   scrollTo(250)
   scrollTo(120)
-  expect(list.children).toHaveLength(85)
+  await waitFor(() => expect(list.children).toHaveLength(85))
 
   const composer = screen.getByRole('form', { name: 'Ввод сообщения' })
   await userEvent.click(within(composer).getByRole('button', { name: /^Run$/ }))
@@ -125,7 +137,7 @@ it('resets expanded pages when switching away from a branch and back', async () 
   const { list, scrollTo } = await renderLongTimeline()
   scrollTo(800)
   scrollTo(250)
-  expect(list.children).toHaveLength(80)
+  await waitFor(() => expect(list.children).toHaveLength(80))
 
   const branchPicker = screen.getByRole('combobox', { name: 'Ветка' })
   await userEvent.selectOptions(branchPicker, side.id)
@@ -205,7 +217,7 @@ it('creates a chat from an empty workspace and opens its main branch', async () 
       return options.method === 'POST' ? Response.json(chat, { status: 201 }) : Response.json([])
     }
     if (url === branchesUrl) return Response.json([main])
-    if (url === timelineUrl(main.id)) return Response.json([])
+    if (url === timelineUrl(main.id)) return Response.json(windowFixture(main, []))
     throw new Error(`Unexpected request: ${url}`)
   })
   vi.stubGlobal('fetch', fetchMock)

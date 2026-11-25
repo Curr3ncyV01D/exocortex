@@ -1,3 +1,4 @@
+import { windowFixture } from '../tests/window-fixture.js'
 import { expect, test } from '@playwright/test'
 import type { ChatGraphResponse } from '../src/api/types.js'
 import { chat, main, timeline } from '../tests/fixtures.js'
@@ -16,7 +17,7 @@ test('loads the minimap lazily, selects nodes and preserves a chat camera across
   let requests = 0
   await page.route('**/api/v1/chats', (route) => route.fulfill({ json: [chat] }))
   await page.route('**/api/v1/chats/*/branches', (route) => route.fulfill({ json: [main] }))
-  await page.route('**/api/v1/branches/*/timeline?*', (route) => route.fulfill({ json: timeline }))
+  await page.route('**/api/v1/branches/*/timeline/window**', (route) => route.fulfill({ json: windowFixture(main, timeline, new URL(route.request().url()).searchParams) }))
   await page.route('**/api/v1/chats/*/graph', (route) => {
     requests++
     return requests === 1
@@ -92,7 +93,7 @@ test('fits a long branched history inside the minimap after the panel is resized
   graph.nodes.push({ ...graph.nodes[0], id: 'side-head', parent_id: 'node-300', role: 'model', is_active: false })
   await page.route('**/api/v1/chats', (route) => route.fulfill({ json: [chat] }))
   await page.route('**/api/v1/chats/*/branches', (route) => route.fulfill({ json: graph.branches }))
-  await page.route('**/api/v1/branches/*/timeline?*', (route) => route.fulfill({ json: timeline }))
+  await page.route('**/api/v1/branches/*/timeline/window**', (route) => route.fulfill({ json: windowFixture(main, timeline, new URL(route.request().url()).searchParams) }))
   await page.route('**/api/v1/chats/*/graph', (route) => route.fulfill({ json: graph }))
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/')

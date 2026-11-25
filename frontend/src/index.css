@@ -258,3 +258,5 @@
 .island-toggle:hover, .island-toggle:focus-visible { color: #f1f3f6; background: #ffffff0a; }
 .explorer-panel { position: relative; }
 .explorer-branch-label { width: 110px; max-width: 110px; line-height: 16px; border-radius: 3px; background: #161718e8; padding: 0 2px; }
+
+.message-card[data-jump-target="true"] { outline: 1px solid #92b7ea; background: #92b7ea0d; }

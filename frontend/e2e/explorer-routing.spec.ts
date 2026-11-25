@@ -1,3 +1,4 @@
+import { windowFixture } from '../tests/window-fixture.js'
 import { expect, test } from '@playwright/test'
 import type { ChatGraphResponse } from '../src/api/types.js'
 import { chat, main, timeline } from '../tests/fixtures.js'
@@ -24,7 +25,7 @@ test('keeps branch labels clear of nodes and exposes names in the preview at low
   }
   await page.route('**/api/v1/chats', (route) => route.fulfill({ json: [chat] }))
   await page.route('**/api/v1/chats/*/branches', (route) => route.fulfill({ json: graph.branches }))
-  await page.route('**/api/v1/branches/*/timeline?*', (route) => route.fulfill({ json: timeline }))
+  await page.route('**/api/v1/branches/*/timeline/window**', (route) => route.fulfill({ json: windowFixture(main, timeline, new URL(route.request().url()).searchParams) }))
   await page.route('**/api/v1/chats/*/graph', (route) => route.fulfill({ json: graph }))
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.goto('/')

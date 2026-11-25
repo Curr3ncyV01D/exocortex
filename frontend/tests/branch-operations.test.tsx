@@ -1,3 +1,4 @@
+import { windowFixture } from './window-fixture'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
@@ -24,7 +25,8 @@ function mockBranches(status = 201) {
     const path = new URL(url, 'http://test').pathname
     if (path === '/api/v1/chats') return Response.json([chat])
     if (path === `/api/v1/chats/${chat.id}/branches`) return Response.json(branches)
-    const [, id, action] = path.match(/\/branches\/([^/]+)\/(timeline|merge|regenerate|run)$/) ?? []
+    const [, id, action] = path.match(/\/branches\/([^/]+)\/(timeline\/window|timeline|merge|regenerate|run)$/) ?? []
+    if (action === 'timeline/window') return Response.json(windowFixture(branches.find((branch) => branch.id === id)!, histories[id], new URL(url, 'http://test').searchParams))
     if (action === 'timeline') return Response.json(histories[id])
     requests.push({ path, body: JSON.parse(String(options.body)) as unknown })
 

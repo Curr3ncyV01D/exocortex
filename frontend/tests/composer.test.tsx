@@ -1,3 +1,4 @@
+import { windowFixture } from './window-fixture'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
@@ -37,10 +38,11 @@ function mockConversation(overrides: {
       message.is_active = (JSON.parse(String(options.body)) as { is_active: boolean }).is_active
       return Response.json({ message_id: messageId, is_active: message.is_active })
     }
-    const [, branchId, action] = path.match(/\/branches\/([^/]+)\/(timeline|messages|run)$/) ?? []
+    const [, branchId, action] = path.match(/\/branches\/([^/]+)\/(timeline\/window|timeline|messages|run)$/) ?? []
     if (!branchId) throw new Error(`Unexpected request: ${url}`)
 
     const history = histories[branchId]
+    if (action === 'timeline/window') return Response.json(windowFixture({ ...main, id: branchId }, history, new URL(url, 'http://test').searchParams))
     if (action === 'timeline') return Response.json(history)
     const request = { branchId, action, body: JSON.parse(String(options.body)) as unknown }
     posts.push(request)

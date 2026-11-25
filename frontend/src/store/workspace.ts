@@ -1,4 +1,7 @@
 import { create } from 'zustand'
+import { createTimelineController, timelineDefaults, type TimelineData, type TimelineActions } from './timeline'
+import { notifyChatChanged } from './chatEvents'
+import { useMessageEdits } from './messageEdits'
 import { api, ApiError, requestErrorMessage, savedRegenerationFork } from '../api/client'
 import type { BranchResponse, ChatResponse, MessageResponse, RunTarget } from '../api/types'
 
@@ -11,20 +14,18 @@ type TurnState =
   | { status: 'saving' | 'generating' }
   | { status: 'error'; message: string; retryTarget?: RunTarget; oversizedQuestionId?: string }
 
-interface WorkspaceData {
+interface WorkspaceData extends TimelineData {
   chats: Resource<ChatResponse[]>
   branches: Resource<BranchResponse[]>
-  timeline: Resource<MessageResponse[]>
   activeChatId: string | null
   activeBranchId: string | null
   turns: Partial<Record<string, TurnState>>
   mutatingMessages: ReadonlySet<string>
 }
 
-interface WorkspaceState extends WorkspaceData {
+export interface WorkspaceState extends WorkspaceData, TimelineActions {
   loadChats: () => Promise<void>
   selectChat: (chatId: string, preferredBranchId?: string) => Promise<void>
-  selectBranch: (branchId: string) => Promise<void>
   createChat: (title: string) => Promise<void>
   sendMessage: (branchId: string, content: string, generate: boolean, submissionKey: string) => Promise<boolean>
   runBranch: (branchId: string, target: RunTarget) => Promise<void>
@@ -39,21 +40,11 @@ interface WorkspaceState extends WorkspaceData {
 const initialData: WorkspaceData = {
   chats: { status: 'idle' },
   branches: { status: 'idle' },
-  timeline: { status: 'idle' },
+  ...timelineDefaults,
   activeChatId: null,
   activeBranchId: null,
   turns: {},
   mutatingMessages: new Set(),
-}
-
-function updateBranchHead(branches: WorkspaceData['branches'], branchId: string, headId: string | null) {
-  if (branches.status !== 'ready') return branches
-  return {
-    ...branches,
-    data: branches.data.map((branch) =>
-      branch.id === branchId ? { ...branch, head_message_id: headId } : branch,
-    ),
-  }
 }
 
 function generationFailure(error: unknown, target: RunTarget, prefix = ''): TurnState {
@@ -72,9 +63,9 @@ function generationFailure(error: unknown, target: RunTarget, prefix = ''): Turn
 export const useWorkspace = create<WorkspaceState>()((set, get) => {
   let chatsRequest: AbortController | undefined
   let branchesRequest: AbortController | undefined
-  let timelineRequest: AbortController | undefined
   let createRequest: AbortController | undefined
   let revision = 0
+  const timelineController = createTimelineController(set, get)
 
   function setTurn(branchId: string, turn?: TurnState) {
     const turns = { ...get().turns }
@@ -89,7 +80,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
   }
 
   function refreshIfSelected(branchId: string) {
-    if (get().activeBranchId === branchId) void get().selectBranch(branchId)
+    if (get().activeBranchId === branchId) void timelineController.refresh()
   }
 
   function openNewBranch(sourceBranchId: string, branch: BranchResponse) {
@@ -113,6 +104,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     try {
       const update = await requestUpdate()
       if (revision !== startedAt) return false
+      timelineController.invalidate(chatId)
       const { activeChatId, activeBranchId, timeline } = get()
       if (activeChatId === chatId && activeBranchId) {
         if (timeline.status === 'ready') {
@@ -122,6 +114,8 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
           refreshIfSelected(activeBranchId)
         }
       }
+      notifyChatChanged(chatId)
+      if (get().activeChatId === chatId) void timelineController.refresh()
       return true
     } finally {
       if (revision === startedAt) {
@@ -132,30 +126,19 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     }
   }
 
-  function recordMessage(branchId: string, message: MessageResponse) {
-    const { activeBranchId, timeline, branches } = get()
-    if (activeBranchId !== branchId) return
-
-    if (timeline.status === 'ready') {
-      if (timeline.data.some(({ id }) => id === message.id)) return
-      const headId = timeline.data.at(-1)?.id ?? null
-      if (headId === message.parent_id) {
-        set({
-          timeline: { status: 'ready', data: [...timeline.data, message] },
-          branches: updateBranchHead(branches, branchId, message.id),
-        })
-        return
-      }
-    }
-    refreshIfSelected(branchId)
+  async function recordMessage(branchId: string, message: MessageResponse, explicit = false) {
+    timelineController.invalidate(message.chat_id)
+    notifyChatChanged(message.chat_id)
+    await timelineController.recordMessage(branchId, message, explicit)
   }
 
-  async function generateReply(branchId: string, target: RunTarget, startedAt: number) {
+  async function generateReply(branchId: string, target: RunTarget, startedAt: number, explicit = false) {
+    const position = timelineController.positionVersion()
     setTurn(branchId, { status: 'generating' })
     try {
       const reply = await api.runTurn(branchId, target)
       if (revision !== startedAt) return
-      recordMessage(branchId, reply)
+      await recordMessage(branchId, reply, explicit && position === timelineController.positionVersion())
       setTurn(branchId)
     } catch (error) {
       if (revision !== startedAt) return
@@ -168,6 +151,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
   return {
     ...initialData,
+    ...timelineController.actions,
 
     async loadChats() {
       chatsRequest?.abort()
@@ -186,13 +170,13 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
     async selectChat(chatId, preferredBranchId) {
       branchesRequest?.abort()
-      timelineRequest?.abort()
+      timelineController.cancel()
       const request = branchesRequest = new AbortController()
       set({
         activeChatId: chatId,
         activeBranchId: preferredBranchId ?? null,
         branches: { status: 'loading' },
-        timeline: { status: 'idle' },
+        ...timelineDefaults,
       })
       try {
         const branches = await api.listBranches(chatId, request.signal)
@@ -204,24 +188,6 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       } catch (error) {
         if (request.signal.aborted) return
         set({ branches: { status: 'error', message: requestErrorMessage(error, 'Не удалось загрузить ветки.') } })
-      }
-    },
-
-    async selectBranch(branchId) {
-      timelineRequest?.abort()
-      const request = timelineRequest = new AbortController()
-      set({ activeBranchId: branchId, timeline: { status: 'loading' } })
-      try {
-        const messages = await api.getTimeline(branchId, request.signal)
-        // The previous request may resolve after its branch has lost focus.
-        if (request.signal.aborted) return
-        set({
-          timeline: { status: 'ready', data: messages },
-          branches: updateBranchHead(get().branches, branchId, messages.at(-1)?.id ?? null),
-        })
-      } catch (error) {
-        if (request.signal.aborted) return
-        set({ timeline: { status: 'error', message: requestErrorMessage(error, 'Не удалось загрузить историю.') } })
       }
     },
 
@@ -252,7 +218,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       }
       if (revision !== startedAt) return true
 
-      recordMessage(branchId, saved)
+      await recordMessage(branchId, saved, true)
       if (generate) void generateReply(branchId, { headId: saved.id, questionId: saved.id }, startedAt)
       else setTurn(branchId)
       return true
@@ -260,7 +226,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
 
     async runBranch(branchId, target) {
       if (branchIsBusy(branchId)) return
-      await generateReply(branchId, target, revision)
+      await generateReply(branchId, target, revision, true)
     },
 
     async editMessage(message, content, force) {
@@ -288,12 +254,18 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
     async forkBranch(sourceBranchId, message, name) {
       const startedAt = revision
       const branch = await api.createBranch(message.chat_id, message.id, name)
-      if (revision === startedAt) openNewBranch(sourceBranchId, branch)
+      if (revision === startedAt) {
+        timelineController.invalidate(message.chat_id)
+        notifyChatChanged(message.chat_id)
+        openNewBranch(sourceBranchId, branch)
+      }
     },
 
     async mergeBranch(source, mainId) {
       const startedAt = revision
       await api.mergeIntoMain(source.id)
+      timelineController.invalidate(source.chat_id)
+      notifyChatChanged(source.chat_id)
       const { activeChatId, activeBranchId } = get()
       if (revision === startedAt && activeChatId === source.chat_id) {
         const preferredBranchId = activeBranchId === source.id ? mainId : activeBranchId ?? undefined
@@ -305,11 +277,17 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       const startedAt = revision
       try {
         const { branch } = await api.regenerate(source.id, headId, name)
-        if (revision === startedAt) openNewBranch(source.id, branch)
+        if (revision === startedAt) {
+          timelineController.invalidate(source.chat_id)
+          notifyChatChanged(source.chat_id)
+          openNewBranch(source.id, branch)
+        }
       } catch (error) {
         const fork = savedRegenerationFork(error)
         if (!fork) throw error
         if (revision !== startedAt) return
+        timelineController.invalidate(source.chat_id)
+        notifyChatChanged(source.chat_id)
         const target = { headId: fork.head_message_id, questionId: fork.head_message_id }
         setTurn(fork.branch_id, generationFailure(error, target, 'Ветка создана. '))
         const { activeChatId, activeBranchId } = get()
@@ -324,8 +302,9 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => {
       revision += 1
       chatsRequest?.abort()
       branchesRequest?.abort()
-      timelineRequest?.abort()
+      timelineController.cancel()
       createRequest?.abort()
+      useMessageEdits.getState().reset()
       set(initialData)
     },
   }
