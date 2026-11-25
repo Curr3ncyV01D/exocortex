@@ -1,3 +1,4 @@
+import { windowFixture } from './window-fixture'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
@@ -17,6 +18,10 @@ function mockMessageApi({ shared = false, forkConflict = false, editConflict = f
   vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit) => {
     const path = new URL(url, 'http://test').pathname
     if (path === '/api/v1/chats') return Response.json([chat])
+    if (path.endsWith('/timeline/window')) {
+      const id = path.split('/')[4]
+      return Response.json(windowFixture(branches.find((branch) => branch.id === id)!, [message], new URL(url, 'http://test').searchParams))
+    }
     if (path.endsWith('/timeline')) return Response.json([message])
     if (path.endsWith('/branches') && options.method !== 'POST') return Response.json(branches)
     const body = options.body ? JSON.parse(String(options.body)) as { content?: string; force?: boolean; is_active?: boolean } : undefined

@@ -29,6 +29,32 @@ export interface MessageResponse {
   updated_at: string | null
 }
 
+export interface GraphNodeResponse {
+  id: string
+  parent_id: string | null
+  role: MessageResponse['role']
+  preview: string
+  preview_truncated: boolean
+  is_active: boolean
+  is_edited: boolean
+  created_at: string
+  updated_at: string | null
+}
+
+export interface GraphMergeResponse {
+  message_id: string
+  source_branch_name: string
+  source_head_message_id: string | null
+  compressed_messages_count: number
+}
+
+export interface ChatGraphResponse {
+  chat_id: string
+  nodes: GraphNodeResponse[]
+  branches: BranchResponse[]
+  merges: GraphMergeResponse[]
+}
+
 export interface MessageActiveResponse {
   message_id: string
   is_active: boolean
@@ -57,4 +83,23 @@ export interface AncestorMutationWarningResponse {
   detail: 'ANCESTOR_MUTATION_WARNING'
   affected_branch_count: number
   message: string
+}
+
+
+export interface TimelineWindowQuery {
+  mode?: 'tail' | 'around' | 'older' | 'newer'
+  anchor_id?: string
+  radius?: number
+  limit?: number
+}
+
+export interface TimelineWindowResponse {
+  branch: BranchResponse
+  messages: MessageResponse[]
+  has_older: boolean
+  has_newer: boolean
+  older_cursor: string | null
+  newer_cursor: string | null
+  last_active_dialogue: { id: string; role: 'user' | 'model' } | null
+  run_target: { expected_head_id: string; expected_question_id: string } | null
 }

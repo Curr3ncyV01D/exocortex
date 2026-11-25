@@ -3,6 +3,7 @@ import type { MessageResponse } from '../../api/types'
 import { isAncestorWarning, requestErrorMessage } from '../../api/client'
 import { useWorkspace } from '../../store/workspace'
 import { MessageDialog } from './MessageDialog'
+import { useMessageEdits } from '../../store/messageEdits'
 
 interface MessageEditorProps {
   message: MessageResponse
@@ -12,12 +13,12 @@ interface MessageEditorProps {
 export function MessageEditor({ message, onClose }: MessageEditorProps) {
   const editMessage = useWorkspace((state) => state.editMessage)
   const pending = useWorkspace((state) => state.mutatingMessages.has(message.id))
-  const [content, setContent] = useState(message.content)
+  const content = useMessageEdits((state) => state.drafts[message.id] ?? message.content)
   const [warning, setWarning] = useState<{ count: number; content: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const editor = useRef<HTMLTextAreaElement>(null)
 
-  useLayoutEffect(() => { editor.current?.focus() }, [])
+  useLayoutEffect(() => { editor.current?.focus({ preventScroll: true }) }, [])
 
   async function save(text: string, force: boolean) {
     if (!text.trim() || pending) return
@@ -50,7 +51,7 @@ export function MessageEditor({ message, onClose }: MessageEditorProps) {
           rows={4}
           value={content}
           readOnly={pending}
-          onChange={(event) => setContent(event.target.value)}
+          onChange={(event) => useMessageEdits.getState().update(message.id, event.target.value)}
         />
         {error && <p role="alert" className="text-sm text-rose-200">{error}</p>}
         <div className="flex flex-wrap justify-end gap-2">

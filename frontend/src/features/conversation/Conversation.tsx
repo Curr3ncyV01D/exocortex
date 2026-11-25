@@ -1,47 +1,11 @@
-import { useLayoutEffect, useRef, useState } from 'react'
-import type { ComponentProps, ReactNode, RefObject } from 'react'
+import { useRef } from 'react'
+import type { ReactNode } from 'react'
 import { LoadError } from '../../components/LoadError'
 import { useWorkspace } from '../../store/workspace'
 import { BranchPicker } from '../branches/BranchPicker'
 import { MergeAction } from '../branches/MergeAction'
 import { ChatInput } from './ChatInput'
-import { MessageTimeline } from './MessageTimeline'
-
-const TIMELINE_PAGE_SIZE = 40
-const TIMELINE_REVEAL_DISTANCE = 250
-
-function PagedMessageTimeline({
-  messages, scrollArea, ...timelineProps
-}: ComponentProps<typeof MessageTimeline> & { scrollArea: RefObject<HTMLDivElement | null> }) {
-  const [expandedStart, setExpandedStart] = useState<number | null>(null)
-  const scrollBeforeReveal = useRef<{ height: number; top: number } | null>(null)
-  const tailStart = Math.max(0, messages.length - TIMELINE_PAGE_SIZE)
-  const start = Math.min(expandedStart ?? tailStart, tailStart)
-
-  useLayoutEffect(() => {
-    const area = scrollArea.current
-    if (!area) return
-    const previous = scrollBeforeReveal.current
-    scrollBeforeReveal.current = null
-    if (previous) area.scrollTop = previous.top + area.scrollHeight - previous.height
-    if (start === 0) return
-
-    let lastTop = Math.max(0, area.scrollTop)
-    const revealOnScroll = () => {
-      const top = Math.max(0, area.scrollTop)
-      const movedUp = top < lastTop
-      lastTop = top
-      if (!movedUp || top > TIMELINE_REVEAL_DISTANCE || scrollBeforeReveal.current) return
-
-      scrollBeforeReveal.current = { height: area.scrollHeight, top }
-      setExpandedStart(Math.max(0, start - TIMELINE_PAGE_SIZE))
-    }
-    area.addEventListener('scroll', revealOnScroll, { passive: true })
-    return () => area.removeEventListener('scroll', revealOnScroll)
-  }, [start, scrollArea])
-
-  return <MessageTimeline {...timelineProps} messages={messages.slice(start)} />
-}
+import { WindowTimeline } from './WindowTimeline'
 
 export function Conversation({ navigation }: { navigation: ReactNode }) {
   const chats = useWorkspace((state) => state.chats)
@@ -55,17 +19,28 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
   const activeBranch = branches.status === 'ready' ? branches.data.find(({ id }) => id === activeBranchId) : undefined
   const mainId = branches.status === 'ready' ? branches.data.find(({ name }) => name === 'main')?.id : undefined
   const scrollArea = useRef<HTMLDivElement>(null)
-  const head = timeline.status === 'ready' ? timeline.data.at(-1) : undefined
-  const headId = head?.id
-  const dialogue = timeline.status === 'ready'
-    ? timeline.data.findLast((message) => message.is_active && message.role !== 'system_merge')
-    : undefined
-  const target = headId && dialogue?.role === 'user' ? { headId, questionId: dialogue.id } : undefined
-
-  useLayoutEffect(() => {
-    const area = scrollArea.current
-    if (area && headId) area.scrollTop = area.scrollHeight
-  }, [activeBranchId, headId])
+  const branchStateReady = useWorkspace((state) => state.branchStateReady)
+  const windowState = useWorkspace((state) => state.windowState)
+  const pageError = useWorkspace((state) => state.pageError)
+  const pageLoading = useWorkspace((state) => state.pageLoading)
+  const navigationState = useWorkspace((state) => state.navigation)
+  const hasUnread = useWorkspace((state) => state.hasUnread)
+  const showLatest = useWorkspace((state) => state.showLatest)
+  const loadPage = useWorkspace((state) => state.loadTimelinePage)
+  const navigateToMessage = useWorkspace((state) => state.navigateToMessage)
+  const headId = windowState?.branch.head_message_id
+  const dialogue = windowState?.last_active_dialogue
+  const target = windowState?.run_target ? {
+    headId: windowState.run_target.expected_head_id, questionId: windowState.run_target.expected_question_id,
+  } : undefined
+  function pagingFeedback(direction: 'older' | 'newer') {
+    return <>
+      {pageLoading === direction && <p role="status" className="p-2 text-xs text-muted">Загружаем сообщения…</p>}
+      {pageError?.direction === direction && <div role="alert" className="p-2 text-sm text-muted">
+        {pageError.message} <button type="button" className="button-secondary" onClick={() => void loadPage(direction)}>Повторить догрузку</button>
+      </div>}
+    </>
+  }
 
   return (
     <main className="workspace-island flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
@@ -85,7 +60,8 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           </div>
         </div>
       </header>
-      <div ref={scrollArea} data-timeline-scroll className="min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:none]">
+      <div className="relative min-h-0 flex-1">
+      <div ref={scrollArea} data-timeline-scroll className="h-full overflow-y-auto overscroll-contain [overflow-anchor:none]">
         <div className="conversation-column py-4 md:py-6">
           {chats.status === 'ready' && !chat && (
             <p className="text-sm text-muted">Создайте чат, чтобы открыть его историю.</p>
@@ -103,7 +79,7 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
           {timeline.status === 'ready' && (
             timeline.data.length > 0
-              ? <PagedMessageTimeline
+              ? <WindowTimeline
                   key={activeBranchId}
                   messages={timeline.data}
                   scrollArea={scrollArea}
@@ -114,8 +90,19 @@ export function Conversation({ navigation }: { navigation: ReactNode }) {
           )}
         </div>
       </div>
+      <div className="pointer-events-none absolute top-1 right-3 left-3 z-20 flex flex-col items-center gap-1 [&>*]:pointer-events-auto [&>*]:rounded-lg [&>*]:bg-[#161718f5] [&>*]:p-2">
+          {navigationState?.status === 'loading' && <p role="status" className="text-sm text-muted">Переходим к сообщению…</p>}
+          {navigationState?.status === 'error' && <div role="alert" className="text-sm text-muted">{navigationState.message}
+            <button type="button" className="button-secondary" onClick={() => void (navigationState.targetId
+              ? navigateToMessage(navigationState.branchId, navigationState.targetId) : showLatest())}>Повторить переход</button>
+          </div>}
+        {pagingFeedback('older')}
+      </div>
+      <div className="pointer-events-none absolute right-3 bottom-1 left-3 z-20 flex justify-center [&>*]:pointer-events-auto [&>*]:rounded-lg [&>*]:bg-[#161718f5] [&>*]:p-2">{pagingFeedback('newer')}</div>
+      </div>
+      {(windowState?.has_newer || hasUnread) && <div className="flex justify-center py-1"><button type="button" className="button-secondary" onClick={() => void showLatest()}>К последним сообщениям</button></div>}
       {activeBranchId && (
-        <ChatInput key={activeBranchId} branchId={activeBranchId} target={target} historyReady={timeline.status === 'ready'} />
+        <ChatInput key={activeBranchId} branchId={activeBranchId} target={target} historyReady={timeline.status === 'ready' && branchStateReady} />
       )}
     </main>
   )

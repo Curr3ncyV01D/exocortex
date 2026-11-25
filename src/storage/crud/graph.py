@@ -334,6 +334,7 @@ async def squash_merge_branch(
         source_branch_name=source_branch_name,
         forked_from_msg_id=start_node_id or target_head_id or source_head_id,
         compressed_messages_count=len(active_delta),
+        source_head_message_id=source_head_id,
     )
     session.add(merge_msg)
     await session.flush()

@@ -12,6 +12,12 @@ from src.agent.diagnostics import describe_failure, logger, operation_id, operat
 from src.config import settings
 from src.agent.loop import LLMGenerationError, run_turn
 from src.storage.crud.chats import append_message
+from src.storage.crud.explorer import read_chat_graph
+from src.storage.crud.timeline import read_timeline_window
+from src.schemas import (
+    BranchResponse, ChatGraphResponse, GraphMergeResponse, GraphNodeResponse, MessageResponse,
+    TimelineWindowQuery, TimelineWindowResponse, DialogueReferenceResponse, RunTargetResponse,
+)
 from src.storage.crud.graph import (
     BranchConflictError,
     BranchNotFoundError,
@@ -75,6 +81,28 @@ async def list_chats(session: AsyncSession) -> list[Chat]:
     return list(await session.scalars(select(Chat).order_by(Chat.updated_at.desc(), Chat.id)))
 
 
+async def get_chat_graph(session: AsyncSession, chat_id: str) -> ChatGraphResponse:
+    """Build a compact graph from one read snapshot without reserving SQLite's writer slot."""
+    async with session.begin():
+        # sqlite3 legacy transaction control does not start a transaction for SELECT.
+        await session.execute(text("BEGIN"))
+        snapshot = await read_chat_graph(session, chat_id)
+        if snapshot is None:
+            raise ChatNotFoundError(f"Чат {chat_id} не найден.")
+        nodes: list[GraphNodeResponse] = []
+        for node in snapshot.messages:
+            normalized = " ".join(node["content"].split())
+            nodes.append(GraphNodeResponse(
+                **{key: value for key, value in node.items() if key != "content"},
+                preview=normalized[:200], preview_truncated=len(normalized) > 200,
+            ))
+        return ChatGraphResponse(
+            chat_id=chat_id, nodes=nodes,
+            branches=[BranchResponse.model_validate(branch) for branch in snapshot.branches],
+            merges=[GraphMergeResponse.model_validate(merge) for merge in snapshot.merges],
+        )
+
+
 async def list_branches(session: AsyncSession, chat_id: str) -> list[Branch]:
     await _require_chat(session, chat_id)
     return list(await session.scalars(
@@ -97,6 +125,31 @@ async def get_timeline(
     return await read_context_from_head(
         branch.chat_id, branch.head_message_id, session, include_inactive=include_inactive,
     )
+
+
+async def get_timeline_window(
+    session: AsyncSession, branch_id: str, *, mode: str = "tail", anchor_id: str | None = None,
+    radius: int | None = None, limit: int | None = None,
+) -> TimelineWindowResponse:
+    """Return the display window and real branch state from one SQLite read snapshot."""
+    query = TimelineWindowQuery(mode=mode, anchor_id=anchor_id, radius=radius, limit=limit)
+    async with session.begin():
+        await session.execute(text("BEGIN"))
+        window = await read_timeline_window(
+            session, branch_id, mode=query.mode, anchor_id=query.anchor_id,
+            radius=20 if query.radius is None else query.radius, limit=40 if query.limit is None else query.limit,
+        )
+        last = window.last_active_dialogue
+        target = RunTargetResponse(expected_head_id=window.branch.head_message_id, expected_question_id=last[0]) \
+            if last is not None and last[1] == MessageRole.USER else None
+        return TimelineWindowResponse(
+            branch=BranchResponse.model_validate(window.branch),
+            messages=[MessageResponse.model_validate(message) for message in window.messages],
+            has_older=window.has_older, has_newer=window.has_newer,
+            older_cursor=window.older_cursor, newer_cursor=window.newer_cursor,
+            last_active_dialogue=DialogueReferenceResponse(id=last[0], role=last[1].value) if last else None,
+            run_target=target,
+        )
 
 
 async def send_message(

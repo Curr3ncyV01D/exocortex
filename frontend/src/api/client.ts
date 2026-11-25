@@ -1,6 +1,6 @@
 import type {
   AncestorMutationWarningResponse, BranchMergeResponse, BranchResponse, ChatResponse,
-  MessageResponse, RegenerateReplyResponse, RunTarget, MessageActiveResponse,
+  MessageResponse, TimelineWindowResponse, TimelineWindowQuery, RegenerateReplyResponse, RunTarget, MessageActiveResponse, ChatGraphResponse,
 } from './types'
 
 const apiPrefix = '/api/v1'
@@ -64,12 +64,22 @@ function jsonRequest<T>(path: string, method: 'POST' | 'PATCH' | 'PUT', body: ob
 }
 
 export const api = {
+  getGraph: (chatId: string, signal?: AbortSignal) =>
+    request<ChatGraphResponse>(`/chats/${encodeURIComponent(chatId)}/graph`, { signal }),
+
   listChats: (signal?: AbortSignal) => request<ChatResponse[]>('/chats', { signal }),
 
   createChat: (title: string, signal?: AbortSignal) => post<ChatResponse>('/chats', { title }, signal),
 
   listBranches: (chatId: string, signal?: AbortSignal) =>
     request<BranchResponse[]>(`/chats/${encodeURIComponent(chatId)}/branches`, { signal }),
+
+  getTimelineWindow: (branchId: string, query: TimelineWindowQuery = {}, signal?: AbortSignal) => {
+    const parameters = new URLSearchParams()
+    for (const [key, value] of Object.entries(query)) if (value !== undefined) parameters.set(key, String(value))
+    const suffix = parameters.size ? `?${parameters}` : ''
+    return request<TimelineWindowResponse>(`/branches/${encodeURIComponent(branchId)}/timeline/window${suffix}`, { signal })
+  },
 
   getTimeline: (branchId: string, signal?: AbortSignal) =>
     request<MessageResponse[]>(

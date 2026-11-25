@@ -15,6 +15,8 @@ from src.schemas import (
     RegenerateReplyResponse,
     RegenerationFailureResponse,
     RunTurnRequest,
+    TimelineWindowQuery,
+    TimelineWindowResponse,
 )
 
 router = APIRouter(tags=["branches"], responses={404: {"model": ErrorResponse}})
@@ -40,6 +42,13 @@ async def get_timeline(
     include_inactive: Annotated[bool, Query(description="Включить скрытые из контекста сообщения")] = False,
 ):
     return await services.get_timeline(session, branch_id, include_inactive=include_inactive)
+
+
+@router.get("/branches/{branch_id}/timeline/window", response_model=TimelineWindowResponse)
+async def get_timeline_window(
+    branch_id: str, session: SessionDep, query: Annotated[TimelineWindowQuery, Query()],
+):
+    return await services.get_timeline_window(session, branch_id, **query.model_dump())
 
 
 @router.post(

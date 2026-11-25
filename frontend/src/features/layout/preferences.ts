@@ -2,6 +2,7 @@ export interface LayoutPreferences {
   sidebarWidth: number
   explorerHeight: number
   explorerOpen: boolean
+  chatsCollapsed?: boolean
 }
 
 const storageKey = 'exocortex.workspace-layout'
@@ -11,13 +12,14 @@ export function getLayoutPreferences(): LayoutPreferences {
   try {
     const saved = localStorage.getItem(storageKey)
     if (!saved) return defaults
-    const { sidebarWidth, explorerHeight, explorerOpen } = JSON.parse(saved) as Partial<LayoutPreferences>
+    const { sidebarWidth, explorerHeight, explorerOpen, chatsCollapsed } = JSON.parse(saved) as Partial<LayoutPreferences>
     return {
       sidebarWidth: typeof sidebarWidth === 'number' && sidebarWidth > 0 && sidebarWidth <= 42
         ? sidebarWidth : defaults.sidebarWidth,
-      explorerHeight: typeof explorerHeight === 'number' && explorerHeight >= 18 && explorerHeight <= 50
+      explorerHeight: typeof explorerHeight === 'number' && explorerHeight >= 18 && explorerHeight < 100
         ? explorerHeight : defaults.explorerHeight,
       explorerOpen: explorerOpen === true,
+      ...(chatsCollapsed === true ? { chatsCollapsed: true } : {}),
     }
   } catch {
     return defaults

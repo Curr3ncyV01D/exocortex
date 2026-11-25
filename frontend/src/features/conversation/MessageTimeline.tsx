@@ -1,4 +1,4 @@
-import { memo, useState } from 'react'
+import { memo } from 'react'
 import type { ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -6,16 +6,11 @@ import type { MessageResponse } from '../../api/types'
 import { asRecord, formatDuration, readExecutionTrace } from './executionTrace'
 import { MessageActions } from './MessageActions'
 import { MessageEditor } from './MessageEditor'
+import { editedTitle } from './messageTime'
+import { useMessageEdits } from '../../store/messageEdits'
 
 const clock = new Intl.DateTimeFormat('ru', { hour: '2-digit', minute: '2-digit' })
-const calendarDate = new Intl.DateTimeFormat('ru', { dateStyle: 'medium' })
 const timestamp = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'short' })
-
-function editedTitle(updatedAt: string | null): string {
-  if (!updatedAt) return 'Реплика отредактирована'
-  const edited = new Date(updatedAt)
-  return `Реплика отредактирована в ${clock.format(edited)} (${calendarDate.format(edited)})`
-}
 
 function TechnicalDetails({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -38,10 +33,12 @@ interface MessageCardProps {
   message: MessageResponse
   branchId?: string
   regenerateHeadId?: string
+  highlighted?: boolean
 }
 
-const MessageCard = memo(function MessageCard({ message, branchId, regenerateHeadId }: MessageCardProps) {
-  const [editing, setEditing] = useState(false)
+const MessageCard = memo(function MessageCard({ message, branchId, regenerateHeadId, highlighted }: MessageCardProps) {
+  const draft = useMessageEdits((state) => state.drafts[message.id])
+  const editing = draft !== undefined
   const created = new Date(message.created_at)
   const trace = message.role === 'model' ? readExecutionTrace(message.metadata) : null
   const duration = formatDuration(trace?.total_duration_ms)
@@ -49,6 +46,8 @@ const MessageCard = memo(function MessageCard({ message, branchId, regenerateHea
   return (
     <li
       className="message-card"
+      data-message-id={message.id}
+      data-jump-target={highlighted || undefined}
       data-role={message.role}
       data-active={message.is_active}
       tabIndex={duration ? 0 : undefined}
@@ -69,7 +68,7 @@ const MessageCard = memo(function MessageCard({ message, branchId, regenerateHea
               message={message}
               branchId={branchId}
               regenerateHeadId={regenerateHeadId}
-              onEdit={() => setEditing(true)}
+              onEdit={() => useMessageEdits.getState().update(message.id, message.content)}
             />
           )}
         </div>
@@ -99,7 +98,7 @@ const MessageCard = memo(function MessageCard({ message, branchId, regenerateHea
         </TechnicalDetails>
       )}
       {editing ? (
-        <MessageEditor message={message} onClose={() => setEditing(false)} />
+        <MessageEditor message={message} onClose={() => useMessageEdits.getState().finish(message.id)} />
       ) : message.role === 'system_merge' ? (
         <TechnicalDetails label="Слияние ветки"><MessageMarkdown content={message.content} /></TechnicalDetails>
       ) : (
@@ -112,16 +111,18 @@ const MessageCard = memo(function MessageCard({ message, branchId, regenerateHea
 interface MessageTimelineProps {
   messages: MessageResponse[]
   branchId?: string
+  highlightedId?: string
   regeneration?: { messageId: string; headId: string }
 }
 
-export function MessageTimeline({ messages, branchId, regeneration }: MessageTimelineProps) {
+export function MessageTimeline({ messages, branchId, regeneration, highlightedId }: MessageTimelineProps) {
   return (
     <ol aria-label="История сообщений" className="space-y-1.5">
       {messages.map((message) => (
         <MessageCard
           key={message.id}
           message={message}
+          highlighted={message.id === highlightedId}
           branchId={branchId}
           regenerateHeadId={regeneration?.messageId === message.id ? regeneration.headId : undefined}
         />
