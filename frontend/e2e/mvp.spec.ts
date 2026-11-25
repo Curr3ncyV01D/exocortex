@@ -18,6 +18,9 @@ test('recovers a lost save and completes a conversation, fork and merge', async 
   await page.getByRole('button', { name: 'Новый чат' }).click()
   await page.getByRole('textbox', { name: 'Название чата' }).fill('Приёмка MVP')
   await page.getByRole('button', { name: 'Создать', exact: true }).click()
+  // Wait for the selected chat to replace the previous chat's composer.
+  await expect(page.getByRole('heading', { name: 'Приёмка MVP', exact: true })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: 'Новый чат', exact: true })).not.toBeVisible()
   const input = page.getByRole('textbox', { name: 'Сообщение' })
   const run = page.getByRole('button', { name: 'Run', exact: true })
   const firstQuestion = 'Первый вопрос для проверки'
